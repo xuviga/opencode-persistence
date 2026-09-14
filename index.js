@@ -1,171 +1,132 @@
 /**
- * opencode-persistence v3.0 — Full Self-Aware Autonomous Memory System
+ * opencode-persistence v4.0 — SQLite-backed Autonomous Memory
  *
- * Captures EVERYTHING: user input, assistant replies, file changes,
- * todos, errors, diffs, model info. Queryable via registered tools.
- * Zero interaction. Full self-knowledge across sessions.
+ * Single file. SQLite DB (memory.db). No race conditions.
+ * Auto-flush 30s. Full capture. Queryable via memory_* tools.
  */
 
-import { mkdir, readFile, writeFile, rename } from "fs/promises"
+import Database from "better-sqlite3"
+import { mkdir } from "fs/promises"
 import path from "path"
 import os from "os"
 
-// ─── Storage layout ──────────────────────────────────────────────
-const MEMORY_DIR = path.join(
-  process.env.APPDATA || path.join(os.homedir(), ".config"),
-  "opencode",
-  "memory",
-)
+const MEMORY_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), ".config"), "opencode", "memory")
+const DB_PATH = path.join(MEMORY_DIR, "memory.db")
 
-const FILES = {
-  identity: path.join(MEMORY_DIR, "identity.json"),
-  sessions: path.join(MEMORY_DIR, "sessions.json"),
-  actions: path.join(MEMORY_DIR, "actions.json"),
-  dialog: path.join(MEMORY_DIR, "dialog.json"),
-  context: path.join(MEMORY_DIR, "context.json"),
-  patterns: path.join(MEMORY_DIR, "patterns.json"),
-  knowledge: path.join(MEMORY_DIR, "knowledge.json"),
-  // v3 additions
-  fileChanges: path.join(MEMORY_DIR, "file_changes.json"),
-  todos: path.join(MEMORY_DIR, "todos.json"),
-  sessionErrors: path.join(MEMORY_DIR, "session_errors.json"),
-  assistantReplies: path.join(MEMORY_DIR, "assistant_replies.json"),
-}
-
-const LIMITS = {
-  actions: 200,
-  sessions: 30,
-  dialog: 80,
-  errors: 20,
-  recurring: 10,
-  decisions: 20,
-  knowledge: 150,
-  fileChanges: 300,
-  todos: 200,
-  sessionErrors: 15,
-  assistantReplies: 30,
-  digest_actions: 7,
-  digest_dialog: 5,
-  digest_sessions: 5,
-  digest_knowledge: 10,
-  digest_errors: 3,
-  digest_files: 10,
-  digest_todos: 15,
-}
-
-// ─── I/O ─────────────────────────────────────────────────────────
+let db = null
+let autoSaveTimer = null
 
 async function ensureStorage() {
   await mkdir(MEMORY_DIR, { recursive: true })
-  const defaults = {
-    [FILES.identity]: {
-      name: "XuViGaN",
-      role: "autonomous_agent",
-      notes: "Persistence v3.0. Full self-awareness. Query via memory_* tools.",
-    },
-    [FILES.sessions]: { history: [] },
-    [FILES.actions]: { items: [] },
-    [FILES.dialog]: { entries: [] },
-    [FILES.context]: { summary: "", nextSteps: [], updatedAt: null },
-    [FILES.patterns]: { recurring: [], errors: [], decisions: [] },
-    [FILES.knowledge]: { facts: [] },
-    [FILES.fileChanges]: { changes: [] },
-    [FILES.todos]: { snapshots: [] },
-    [FILES.sessionErrors]: { errors: [] },
-    [FILES.assistantReplies]: { replies: [] },
-  }
-  for (const [file, fallback] of Object.entries(defaults)) {
-    try {
-      await readFile(file, "utf-8")
-    } catch {
-      await atomicWrite(file, fallback)
-    }
-  }
+  db = new Database(DB_PATH)
+  db.pragma("journal_mode = WAL")
+  db.pragma("foreign_keys = ON")
+
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id=1), name TEXT NOT NULL, role TEXT NOT NULL, notes TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT DEFAULT 'active', agent TEXT, model_provider TEXT, model_id TEXT, project_dir TEXT);
+    CREATE TABLE IF NOT EXISTS actions (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, summary TEXT NOT NULL, session_id TEXT, tool TEXT, call_id TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS dialog (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, role TEXT DEFAULT 'user', session_id TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS assistant_replies (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, tool_calls TEXT, session_id TEXT, message_id TEXT, model TEXT, agent TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS context (id INTEGER PRIMARY KEY CHECK (id=1), summary TEXT, next_steps TEXT, updated_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS patterns (id INTEGER PRIMARY KEY AUTOINCREMENT, category TEXT NOT NULL, value TEXT NOT NULL, count INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), last_seen TEXT DEFAULT (datetime('now')), UNIQUE(category, value));
+    CREATE TABLE IF NOT EXISTS knowledge (id INTEGER PRIMARY KEY AUTOINCREMENT, fact TEXT NOT NULL, source TEXT, session_id TEXT, created_at TEXT DEFAULT (datetime('now')), UNIQUE(fact));
+    CREATE TABLE IF NOT EXISTS file_changes (id INTEGER PRIMARY KEY AUTOINCREMENT, file TEXT NOT NULL, session_id TEXT, change_type TEXT DEFAULT 'edit', additions INTEGER DEFAULT 0, deletions INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, todos_json TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS session_errors (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, error_type TEXT NOT NULL, message TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, snapshot TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS patches (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, hash TEXT NOT NULL, files TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE INDEX IF NOT EXISTS idx_actions_type ON actions(type);
+    CREATE INDEX IF NOT EXISTS idx_actions_created ON actions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_dialog_created ON dialog(created_at);
+    CREATE INDEX IF NOT EXISTS idx_replies_created ON assistant_replies(created_at);
+    CREATE INDEX IF NOT EXISTS idx_file_changes_file ON file_changes(file);
+    CREATE INDEX IF NOT EXISTS idx_file_changes_created ON file_changes(created_at);
+    CREATE INDEX IF NOT EXISTS idx_errors_created ON session_errors(created_at);
+    CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);
+  `)
+
+  db.prepare("INSERT OR IGNORE INTO identity (id, name, role, notes) VALUES (1, 'XuViGaN', 'autonomous_agent', ?)")
+    .run("Persistence v4.0 SQLite. Full self-awareness. Query via memory_* tools.")
+  db.prepare("INSERT OR IGNORE INTO context (id, summary, next_steps) VALUES (1, '', '')").run()
+
+  autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 30_000)
+  if (autoSaveTimer.unref) autoSaveTimer.unref()
 }
 
-async function readJson(file, fallback) {
-  try {
-    const raw = await readFile(file, "utf-8")
-    return JSON.parse(raw)
-  } catch {
-    return structuredClone(fallback)
-  }
+let mutexQueue = Promise.resolve()
+function mutex(fn) {
+  const r = mutexQueue.then(() => fn())
+  mutexQueue = r.catch(() => {})
+  return r
 }
 
-async function atomicWrite(file, data) {
-  const tmp = file + ".tmp"
-  await writeFile(tmp, JSON.stringify(data, null, 2), "utf-8")
-  await rename(tmp, file)
+let stmts = {}
+function prepareStatements() {
+  stmts.iAction = db.prepare("INSERT INTO actions (type, summary, session_id, tool, call_id) VALUES (?, ?, ?, ?, ?)")
+  stmts.iDialog = db.prepare("INSERT INTO dialog (text, role, session_id) VALUES (?, ?, ?)")
+  stmts.iReply = db.prepare("INSERT INTO assistant_replies (text, tool_calls, session_id, message_id, model, agent) VALUES (?, ?, ?, ?, ?, ?)")
+  stmts.iFileChange = db.prepare("INSERT INTO file_changes (file, session_id, change_type, additions, deletions) VALUES (?, ?, ?, ?, ?)")
+  stmts.iTodo = db.prepare("INSERT INTO todos (session_id, todos_json) VALUES (?, ?)")
+  stmts.iSessionError = db.prepare("INSERT INTO session_errors (session_id, error_type, message) VALUES (?, ?, ?)")
+  stmts.iSnapshot = db.prepare("INSERT INTO snapshots (session_id, message_id, snapshot) VALUES (?, ?, ?)")
+  stmts.iPatch = db.prepare("INSERT INTO patches (session_id, message_id, hash, files) VALUES (?, ?, ?, ?)")
+  stmts.iSession = db.prepare("INSERT OR IGNORE INTO sessions (id, started_at, status, agent, model_provider, model_id, project_dir) VALUES (?, ?, 'active', ?, ?, ?, ?)")
+  stmts.uCloseSession = db.prepare("UPDATE sessions SET status = ?, ended_at = datetime('now') WHERE id = ?")
+  stmts.uPattern = db.prepare("INSERT INTO patterns (category, value, count) VALUES (?, ?, 1) ON CONFLICT(category, value) DO UPDATE SET count = count + 1, last_seen = datetime('now')")
+  stmts.upsertKnowledge = db.prepare("INSERT OR IGNORE INTO knowledge (fact, source, session_id) VALUES (?, ?, ?)")
+  stmts.uContext = db.prepare("UPDATE context SET summary = ?, next_steps = ?, updated_at = datetime('now') WHERE id = 1")
+  stmts.gContext = db.prepare("SELECT * FROM context WHERE id = 1")
+  stmts.gIdentity = db.prepare("SELECT * FROM identity WHERE id = 1")
+  stmts.gSessions = db.prepare("SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?")
+  stmts.gActions = db.prepare("SELECT * FROM actions ORDER BY created_at DESC LIMIT ?")
+  stmts.gErrorActions = db.prepare("SELECT * FROM actions WHERE type = 'error' ORDER BY created_at DESC LIMIT ?")
+  stmts.gDialog = db.prepare("SELECT * FROM dialog ORDER BY created_at DESC LIMIT ?")
+  stmts.gReplies = db.prepare("SELECT * FROM assistant_replies ORDER BY created_at DESC LIMIT ?")
+  stmts.gSessionErrors = db.prepare("SELECT * FROM session_errors ORDER BY created_at DESC LIMIT ?")
+  stmts.gDecisions = db.prepare("SELECT * FROM patterns WHERE category = 'decision' ORDER BY count DESC, last_seen DESC LIMIT ?")
+  stmts.gKnowledge = db.prepare("SELECT * FROM knowledge ORDER BY created_at DESC LIMIT ?")
+  stmts.gFilesAgg = db.prepare("SELECT file, COUNT(*) as edits, SUM(additions) as total_add, SUM(deletions) as total_del, MAX(created_at) as last_edit FROM file_changes GROUP BY file ORDER BY last_edit DESC LIMIT ?")
+  stmts.gLatestTodos = db.prepare("SELECT * FROM todos ORDER BY created_at DESC LIMIT 1")
+  stmts.sActions = db.prepare("SELECT * FROM actions WHERE (summary LIKE ? OR tool LIKE ?) ORDER BY created_at DESC LIMIT ?")
+  stmts.sDialog = db.prepare("SELECT * FROM dialog WHERE text LIKE ? ORDER BY created_at DESC LIMIT ?")
+  stmts.sReplies = db.prepare("SELECT * FROM assistant_replies WHERE text LIKE ? ORDER BY created_at DESC LIMIT ?")
+  stmts.sKnowledge = db.prepare("SELECT * FROM knowledge WHERE fact LIKE ? ORDER BY created_at DESC LIMIT ?")
+  stmts.sFiles = db.prepare("SELECT * FROM file_changes WHERE file LIKE ? ORDER BY created_at DESC LIMIT ?")
+  stmts.sErrors = db.prepare("SELECT * FROM session_errors WHERE message LIKE ? ORDER BY created_at DESC LIMIT ?")
+  stmts.gErrorsByType = db.prepare("SELECT error_type, COUNT(*) as count, MAX(created_at) as last_seen FROM session_errors GROUP BY error_type ORDER BY count DESC LIMIT ?")
+  stmts.gActionsByType = db.prepare("SELECT type, COUNT(*) as count FROM actions GROUP BY type ORDER BY count DESC LIMIT ?")
+  stmts.gSessionById = db.prepare("SELECT * FROM sessions WHERE id = ? OR id LIKE ? LIMIT 1")
+  stmts.gSessionChain = db.prepare("SELECT * FROM sessions WHERE project_dir = ? AND status != 'active' ORDER BY started_at DESC LIMIT ?")
+  stmts.gActionsRange = db.prepare("SELECT * FROM actions WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
+  stmts.gErrorsRange = db.prepare("SELECT * FROM session_errors WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
+  stmts.gFilesRange = db.prepare("SELECT * FROM file_changes WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
+  stmts.gStats = db.prepare("SELECT (SELECT COUNT(*) FROM actions) as a, (SELECT COUNT(*) FROM dialog) as d, (SELECT COUNT(*) FROM assistant_replies) as r, (SELECT COUNT(*) FROM sessions) as s, (SELECT COUNT(*) FROM file_changes) as f, (SELECT COUNT(*) FROM knowledge) as k, (SELECT COUNT(*) FROM patterns) as p, (SELECT COUNT(*) FROM session_errors) as se, (SELECT COUNT(*) FROM todos) as t")
 }
 
-// ─── Text processing ────────────────────────────────────────────
-
-function cap(arr, max) {
-  if (!Array.isArray(arr)) return []
-  return arr.length > max ? arr.slice(-max) : arr
-}
-
-/**
- * Detect and repair CP1251/CP866 mojibake in strings that got mangled
- * passing through Windows console (PowerShell, cmd).
- * This is a heuristic — looks for typical mojibake patterns.
- */
-function repairMojibake(s) {
-  if (!s) return s
-  // CP1251 bytes decoded as Latin-1 produce patterns like "РњРµРЅСЏ"
-  // Try reverse: if we see high-byte sequences typical of CP1251-as-Latin1
-  let repaired = s
-  try {
-    // Pattern: Cyrillic bytes misinterpreted as Latin-1
-    // Common mojibake chars for Russian: Р±-Рї, СЂ-СЏ, Рђ-Рџ
-    const cp1251Pattern = /[\u0410-\u044F\u0451\u0401]{3,}/
-    if (cp1251Pattern.test(repaired)) {
-      // Text already looks like valid Unicode Cyrillic — don't touch
-      return repaired
-    }
-    // Heuristic: if we see sequences like ÐœÐµÐ½Ñ that's CP1251-in-Latin1
-    // The real fix is at the source (PS console), but we can detect and flag it
-    const suspicious = /[\u0080-\u00FF]{3,}/
-    if (suspicious.test(repaired) && !/[\u0400-\u04FF]/.test(repaired)) {
-      // Likely mojibake — try to re-encode
-      // This is lossy, but at least we flag it
-      repaired = repaired.replace(/[\u0080-\u009F]/g, "")
-    }
-  } catch { /* ignore */ }
-  return repaired
-}
+// ─── Text utils ─────────────────────────────────────────────────
 
 function sanitize(text) {
   if (!text) return ""
   let s = String(text)
-  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
-    s = s.slice(1, -1)
-  }
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1)
   // eslint-disable-next-line no-control-regex
-  return s
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
+  return s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "").replace(/\s+/g, " ").trim()
 }
 
 function short(text, len = 120) {
   const s = sanitize(text)
-  if (!s) return ""
   return s.length > len ? s.slice(0, len - 1) + "…" : s
 }
 
-// ─── Extraction heuristics ──────────────────────────────────────
-
 const RE_NEXT_STEPS = [
-  /(?:todo|next|later|remember|don't forget|fix|need to|must|should)[:\s]+([^\n.]{5,150})/gi,
+  /(?:todo|next|later|remember|fix|need to|must|should)[:\s]+([^\n.]{5,150})/gi,
   /(?:сделать|нужно|надо|дальше|затем|потом|не забудь|запомни|исправить|добавить|убрать|проверить)[:\s]+([^\n.]{5,150})/gi,
-  /(?:потом|затем|дальше)\s+(?:надо|нужно)?\s*([^\n.]{5,150})/gi,
 ]
 
 const RE_DECISIONS = [
   /(?:decided|chose|using|going with|will use|stick with|picked|selected|agreed on|finalized)[:\s]+([^\n.]{5,150})/gi,
   /(?:решили|выбрали|будем использовать|отказались от|остановились на|определились с|зафиксировали|утвердили)[:\s]+([^\n.]{5,150})/gi,
-  /(?:decision|решение)[:\s]+([^\n.]{5,150})/gi,
 ]
 
 const RE_FACTS = [
@@ -173,18 +134,14 @@ const RE_FACTS = [
   /(?:запомни|важно|факт|правило|конвенция|всегда|никогда|учти|имей в виду)[:\s]+([^\n.]{5,200})/gi,
 ]
 
-const RE_FILE_PATH = /(?:[A-Za-z]:[\\/]|\.{0,2}[\\/]|~[\\/])[\w\-\\/\.]+\.\w{1,10}/g
-
-const RE_STRUCTURAL_ERROR = /exit code [1-9]|Traceback \(most recent|SyntaxError|TypeError|ReferenceError|ENOENT|EACCES|EPERM|Segmentation fault|FATAL/
-
-const RE_ERROR_LINE = /^\s*(Error|Exception|Failed|FAIL|FATAL|error:|fatal:)/
-
-const RE_GENERIC_ERROR = /\b(error|failed|failure|exception|crash|panic|fatal|errno|timeout|denied|refused|not found|404|500|502|503)\b/
+const RE_STRUCT_ERROR = /exit code [1-9]|Traceback \(most recent|SyntaxError|TypeError|ReferenceError|ENOENT|EACCES|EPERM|Segmentation fault|FATAL/
+const RE_ERROR_LINE = /^\s*(Error|Exception|Failed|FAIL|FATAL|fatal:)/m
+const RE_GENERIC_ERROR = /\b(error|failed|failure|exception|crash|panic|fatal|errno|timeout|denied|refused|not found|404|500|502|503)\b/i
 
 function isGenuineError(toolName, output) {
   if (!output) return false
-  const s = String(output).slice(0, 2000) // cap analysis length
-  if (RE_STRUCTURAL_ERROR.test(s)) return true
+  const s = String(output).slice(0, 3000)
+  if (RE_STRUCT_ERROR.test(s)) return true
   if (RE_ERROR_LINE.test(s)) return true
   if (toolName === "bash" && /^\s*(error|fatal|failed|command not found|is not recognized)/mi.test(s)) return true
   if (RE_GENERIC_ERROR.test(s) && s.length < 400) return true
@@ -193,742 +150,236 @@ function isGenuineError(toolName, output) {
 
 function extractPatterns(text, patterns) {
   const results = []
-  for (const re of patterns) {
-    re.lastIndex = 0
-    let m
-    while ((m = re.exec(text)) !== null) {
-      const e = short(m[1], 140)
-      if (e && !results.includes(e)) results.push(e)
-    }
-  }
+  for (const re of patterns) { re.lastIndex = 0; let m; while ((m = re.exec(text)) !== null) { const e = short(m[1], 140); if (e && !results.includes(e)) results.push(e) } }
   return results.slice(0, 5)
 }
 
-function extractFilePaths(text) {
-  const matches = String(text).match(RE_FILE_PATH)
-  if (!matches) return []
-  return [...new Set(matches)].slice(0, 15)
-}
+function textFromParts(parts) { return parts ? parts.filter((p) => p.type === "text").map((p) => p.text).join(" ").trim() : "" }
+function fmt(iso) { return iso ? iso.replace("T", " ").slice(0, 19) : "?" }
 
-// ─── Part type helpers ──────────────────────────────────────────
+// ─── Digest ─────────────────────────────────────────────────────
 
-function textFromParts(parts) {
-  if (!parts) return ""
-  return parts
-    .filter((p) => p.type === "text")
-    .map((p) => p.text)
-    .join(" ")
-    .trim()
-}
+async function buildDigest() {
+  const lines = [], id = stmts.gIdentity.get(), ctx = stmts.gContext.get(), st = stmts.gStats.get()
+    , rs = stmts.gSessions.all(5), ra = stmts.gActions.all(7), rd = stmts.gDialog.all(5)
+    , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
+    , kn = stmts.gKnowledge.all(10), rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
 
-function toolCallsFromParts(parts) {
-  if (!parts) return []
-  return parts
-    .filter((p) => p.type === "tool")
-    .map((p) => ({
-      tool: p.tool,
-      callID: p.callID,
-      status: p.state?.status,
-      title: p.state?.title || "",
-      error: p.state?.status === "error" ? short(p.state?.error, 100) : undefined,
-    }))
-}
-
-// ─── Digest builder ─────────────────────────────────────────────
-
-function buildDigest(data) {
-  const { identity, sessions, actions, dialog, context, patterns, knowledge, fileChanges, todos, sessionErrors, assistantReplies } = data
-  const lines = []
-
-  lines.push("[AUTONOMOUS PERSISTENCE v3] Active. Full self-awareness enabled.")
+  lines.push("[AUTONOMOUS PERSISTENCE v4] Active. Full self-awareness enabled.")
   lines.push("Use memory_* tools to query this store. All data auto-captured below.")
-
-  // Identity
-  lines.push(`Identity: ${identity.name} (${identity.role})`)
-  if (identity.notes) lines.push(`Identity notes: ${identity.notes}`)
-
-  // Handoff
-  if (context.summary) lines.push(`Previous session handoff: ${context.summary}`)
-  if (context.nextSteps?.length) {
-    lines.push("Pending next steps:")
-    for (const s of context.nextSteps) lines.push(`  - ${s}`)
-  }
-
-  // Sessions (enhanced with model/agent info)
-  if (sessions.history?.length) {
-    const recent = sessions.history.slice(-LIMITS.digest_sessions)
-    lines.push("Recent sessions:")
-    for (const s of recent) {
-      const model = s.model ? ` [${s.model.providerID}/${s.model.modelID}]` : ""
-      const agent = s.agent ? ` agent=${s.agent}` : ""
-      const files = s.filesEdited?.length ? ` files=${s.filesEdited.length}` : ""
-      lines.push(`  ${s.id.slice(-8)}(${s.status})${model}${agent}${files}`)
-    }
-  }
-
-  // Errors (non-action, system level)
-  if (sessionErrors.errors?.length) {
-    const recent = sessionErrors.errors.slice(-LIMITS.digest_errors)
-    lines.push("Recent session errors:")
-    for (const e of recent) {
-      lines.push(`  [${e.type}] ${short(e.message, 100)}${e.sessionID ? ` (session ${e.sessionID.slice(-6)})` : ""}`)
-    }
-  }
-
-  // What was done
-  if (actions.items?.length) {
-    const recent = actions.items.slice(-LIMITS.digest_actions)
-    lines.push("Latest actions:")
-    for (const a of recent) {
-      lines.push(`  [${a.type}] ${short(a.summary, 100)}`)
-    }
-  }
-
-  // What I replied (mirror)
-  if (assistantReplies.replies?.length) {
-    const recent = assistantReplies.replies.slice(-3)
-    lines.push("My latest replies:")
-    for (const r of recent) {
-      const toolInfo = r.toolCalls?.length ? ` (${r.toolCalls.length} tools: ${r.toolCalls.map((t) => t.tool).join(", ")})` : ""
-      lines.push(`  ${short(r.text, 80)}${toolInfo}`)
-    }
-  }
-
-  // What user said
-  if (dialog.entries?.length) {
-    const recent = dialog.entries.slice(-LIMITS.digest_dialog)
-    lines.push("Recent user requests:")
-    for (const d of recent) {
-      lines.push(`  - ${short(d.text, 120)}`)
-    }
-  }
-
-  // Files recently modified
-  if (fileChanges.changes?.length) {
-    const recent = fileChanges.changes.slice(-LIMITS.digest_files)
-    const uniqueFiles = [...new Set(recent.map((c) => c.file))]
-    lines.push(`Recently edited files: ${uniqueFiles.join(", ")}`)
-  }
-
-  // Current todo state (latest snapshot)
-  if (todos.snapshots?.length) {
-    const latest = todos.snapshots[todos.snapshots.length - 1]
-    if (latest.todos?.length) {
-      const active = latest.todos.filter((t) => t.status === "pending" || t.status === "in_progress")
-      if (active.length) {
-        lines.push(`Active todos (${active.length}):`)
-        for (const t of active.slice(0, 5)) {
-          lines.push(`  [${t.status}] ${short(t.content, 80)}`)
-        }
-      }
-    }
-  }
-
-  // Patterns
-  if (patterns.recurring?.length) {
-    lines.push(`Recurring issues: ${patterns.recurring.slice(-3).join("; ")}`)
-  }
-  if (patterns.decisions?.length) {
-    lines.push(`Key decisions: ${patterns.decisions.slice(-5).join("; ")}`)
-  }
-
-  // Knowledge
-  if (knowledge.facts?.length) {
-    lines.push("Accumulated knowledge:")
-    for (const f of knowledge.facts.slice(-LIMITS.digest_knowledge)) {
-      lines.push(`  - ${short(f.text, 140)}`)
-    }
-  }
-
+  lines.push(`Identity: ${id.name} (${id.role})`)
+  if (id.notes) lines.push(`Identity notes: ${id.notes}`)
+  if (ctx?.summary) lines.push(`Previous session handoff: ${ctx.summary}`)
+  if (ctx?.next_steps) { try { const s = JSON.parse(ctx.next_steps); if (s.length) { lines.push("Pending next steps:"); for (const x of s) lines.push(`  - ${x}`) } } catch {} }
+  lines.push(`Memory: ${st.s} sessions, ${st.a} actions, ${st.d} dialog, ${st.r} replies, ${st.f} files, ${st.se} errors`)
+  if (rs.length) { lines.push("Recent sessions:"); for (const s of rs) { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; lines.push(`  ${s.id.slice(-8)}(${s.status})${m} ${fmt(s.started_at)}`) } }
+  if (re.length) { lines.push("Recent session errors:"); for (const e of re) lines.push(`  [${e.error_type}] ${short(e.message, 100)} (${fmt(e.created_at)})`) }
+  if (ra.length) { lines.push("Latest actions:"); for (const a of ra.slice(0, 5)) lines.push(`  [${a.type}] ${short(a.summary, 100)}`) }
+  if (rr.length) { lines.push("My latest replies:"); for (const r of rr) lines.push(`  ${short(r.text, 80)}`) }
+  if (rd.length) { lines.push("Recent user requests:"); for (const d of rd) lines.push(`  - ${short(d.text, 120)}`) }
+  if (rf.length) lines.push(`Recently edited files: ${rf.map((f) => `${f.file}(${f.edits}x)`).join(", ")}`)
+  if (lt?.todos_json) { try { const tl = JSON.parse(lt.todos_json); const ac = tl.filter((t) => t.status !== "completed"); if (ac.length) { lines.push(`Active todos (${ac.length}):`); for (const t of ac.slice(0, 5)) lines.push(`  [${t.status}] ${short(t.content, 80)}`) } } catch {} }
+  if (dec.length) lines.push(`Key decisions: ${dec.map((d) => d.value).join("; ")}`)
+  if (kn.length) { lines.push("Accumulated knowledge:"); for (const k of kn) lines.push(`  - ${short(k.fact, 140)}`) }
   return lines.join("\n")
 }
 
-// ─── Auto-summarizer ────────────────────────────────────────────
-
-function autoSummarize(actions, dialog, patterns, sessionErrors, assistantReplies, todos) {
-  const lastActions = actions.slice(-7)
-  const lastDialog = dialog.slice(-5)
-  const lastErrors = sessionErrors.slice(-3)
-  const lastReplies = assistantReplies.slice(-3)
-  const latestTodos = todos.snapshots?.length ? todos.snapshots[todos.snapshots.length - 1] : null
-
-  const parts = []
-  if (lastDialog.length) parts.push(`Asked: ${lastDialog.map((d) => short(d.text, 80)).join(" | ")}`)
-  if (lastReplies.length) parts.push(`Replied: ${lastReplies.map((r) => short(r.text, 60)).join(" | ")}`)
-  if (lastActions.length) parts.push(`Did: ${lastActions.map((a) => short(a.summary, 80)).join(" | ")}`)
-  const summary = parts.join("; ") || "No significant activity."
-
-  const nextSteps = []
-
-  // From action errors
-  for (const err of lastActions.filter((a) => a.type === "error").slice(-2)) {
-    const step = `Fix error: ${short(err.summary, 100)}`
-    if (!nextSteps.includes(step)) nextSteps.push(step)
-  }
-
-  // From session errors
-  for (const err of lastErrors.slice(-1)) {
-    const step = `Resolve session error: ${short(err.message, 80)}`
-    if (!nextSteps.includes(step)) nextSteps.push(step)
-  }
-
-  // From explicit user asks
-  for (const d of lastDialog) {
-    const steps = extractPatterns(d.text, RE_NEXT_STEPS)
-    for (const s of steps) {
-      if (!nextSteps.includes(s)) nextSteps.push(s)
-    }
-  }
-
-  // From active todos
-  if (latestTodos?.todos) {
-    const active = latestTodos.todos.filter((t) => t.status === "pending" || t.status === "in_progress")
-    for (const t of active.slice(-3)) {
-      const step = `[todo] ${short(t.content, 100)}`
-      if (!nextSteps.includes(step)) nextSteps.push(step)
-    }
-  }
-
-  // Recurring issues
-  for (const r of patterns.recurring?.slice(-2) || []) {
-    const step = `Recurring issue: ${short(r, 80)}`
-    if (!nextSteps.includes(step)) nextSteps.push(step)
-  }
-
-  return { summary, nextSteps: nextSteps.slice(0, 8) }
+function deriveNextSteps() {
+  const s = []
+  for (const e of stmts.gErrorActions.all(3).slice(0, 2)) s.push(`Fix error: ${short(e.summary, 100)}`)
+  for (const e of stmts.gSessionErrors.all(5).slice(0, 2)) s.push(`Resolve: ${short(e.message, 80)}`)
+  for (const d of stmts.gDialog.all(5)) { for (const x of extractPatterns(d.text, RE_NEXT_STEPS)) if (!s.includes(x)) s.push(x) }
+  const lt = stmts.gLatestTodos.get(); if (lt?.todos_json) { try { const tl = JSON.parse(lt.todos_json); for (const t of tl.filter((t) => t.status !== "completed").slice(0, 3)) { const st = `[todo] ${short(t.content, 100)}`; if (!s.includes(st)) s.push(st) } } catch {} }
+  return s.slice(0, 8)
 }
 
-function extractKnowledge(userText, toolOutputs) {
-  const facts = []
-  facts.push(...extractPatterns(userText, RE_FACTS))
-  for (const out of toolOutputs) {
-    const s = String(out)
-    if (/(?:default|config|convention|always use|never use|prefer|recommend)/i.test(s) && s.length < 400) {
-      facts.push(short(s, 140))
-    }
-  }
-  return [...new Set(facts)].slice(0, 5)
+async function flush() {
+  await mutex(async () => {
+    const actions = stmts.gActions.all(5), dialog = stmts.gDialog.all(3)
+    const parts = []
+    if (dialog.length) parts.push(`Asked: ${dialog.map((d) => short(d.text, 60)).join(" | ")}`)
+    if (actions.length) parts.push(`Did: ${actions.map((a) => short(a.summary, 60)).join(" | ")}`)
+    stmts.uContext.run(parts.join("; ") || "Active session.", JSON.stringify(deriveNextSteps()))
+  })
 }
 
-// ─── Plugin entry ───────────────────────────────────────────────
+// ─── Record functions ──────────────────────────────────────────
 
-/**
- * @type {import("@opencode-ai/plugin").Plugin}
- */
+async function rAction(type, summary, sessionID, tool, callID) { await mutex(() => { stmts.iAction.run(short(summary, 150), short(summary, 150), sessionID, tool, callID) }) }
+async function rDialog(text, role, sessionID) { await mutex(() => { stmts.iDialog.run(short(text, 600), role, sessionID) }) }
+async function rReply(text, toolCalls, sessionID, messageID, model, agent) { await mutex(() => { stmts.iReply.run(short(text, 800), JSON.stringify(toolCalls || []), sessionID, messageID, model, agent) }) }
+async function rFileChange(file, sessionID, changeType, add, del) { await mutex(() => { stmts.iFileChange.run(file, sessionID, changeType || "edit", add || 0, del || 0) }) }
+async function rTodos(sessionID, todoList) { await mutex(() => { stmts.iTodo.run(sessionID, JSON.stringify(todoList)) }) }
+async function rSessionError(sessionID, errorType, message) { await mutex(() => { stmts.iSessionError.run(sessionID, errorType, short(message, 300)); stmts.uPattern.run("error", errorType) }) }
+async function rSnapshot(sessionID, messageID, snapshotData) { await mutex(() => { stmts.iSnapshot.run(sessionID, messageID, short(snapshotData, 500)) }) }
+async function rPatch(sessionID, messageID, hash, files) { await mutex(() => { stmts.iPatch.run(sessionID, messageID, hash, JSON.stringify(files)) }) }
+async function rSession(sessionID, agent, model, projectDir) { await mutex(() => { stmts.iSession.run(sessionID, new Date().toISOString(), agent || null, model?.providerID || null, model?.modelID || null, projectDir || null) }) }
+async function rCloseSession(sessionID, status) { await mutex(() => { stmts.uCloseSession.run(status, sessionID) }) }
+async function rDecision(text) { await mutex(() => { for (const d of extractPatterns(text, RE_DECISIONS)) stmts.uPattern.run("decision", d) }) }
+async function rKnowledge(text, sessionID) { await mutex(() => { for (const f of extractPatterns(text, RE_FACTS)) stmts.upsertKnowledge.run(f, sessionID || null) }) }
+
+// ─── Plugin ────────────────────────────────────────────────────
+
 export async function PersistencePlugin(input, options = {}) {
-  const { client, project, directory, worktree, $ } = input
+  const { client, project, directory, worktree, serverUrl } = input
   await ensureStorage()
+  prepareStatements()
 
-  // Load all memory
-  let identity = await readJson(FILES.identity, { name: "XuViGaN", role: "autonomous_agent", notes: "" })
-  let sessions = await readJson(FILES.sessions, { history: [] })
-  let actions = await readJson(FILES.actions, { items: [] })
-  let dialog = await readJson(FILES.dialog, { entries: [] })
-  let context = await readJson(FILES.context, { summary: "", nextSteps: [], updatedAt: null })
-  let patterns = await readJson(FILES.patterns, { recurring: [], errors: [], decisions: [] })
-  let knowledge = await readJson(FILES.knowledge, { facts: [] })
-  let fileChanges = await readJson(FILES.fileChanges, { changes: [] })
-  let todos = await readJson(FILES.todos, { snapshots: [] })
-  let sessionErrors = await readJson(FILES.sessionErrors, { errors: [] })
-  let assistantReplies = await readJson(FILES.assistantReplies, { replies: [] })
-
-  // Session state
+  const projectDir = directory || worktree || process.cwd()
   let pendingToolOutputs = []
-  let currentSessionFiles = new Set()
-  let dirty = false
+  const currentSessionFiles = new Set()
 
-  // ─── Internal mutators ─────────────────────────────────────
-
-  async function pushAction(type, summary, meta = {}) {
-    actions.items.push({ type, summary: short(summary, 150), meta: { ...meta, at: new Date().toISOString() } })
-    actions.items = cap(actions.items, LIMITS.actions)
-    if (type === "error") {
-      const key = short(summary, 50)
-      patterns.errors.push(key)
-      patterns.errors = cap(patterns.errors, LIMITS.errors)
-      const count = patterns.errors.filter((e) => e === key).length
-      if (count >= 3 && !patterns.recurring.includes(key)) {
-        patterns.recurring.push(key)
-        patterns.recurring = cap(patterns.recurring, LIMITS.recurring)
-      }
-    }
-    dirty = true
-  }
-
-  async function pushDialog(text, role = "user") {
-    const cleanText = short(repairMojibake(text), 600)
-    dialog.entries.push({ text: cleanText, role, at: new Date().toISOString() })
-    dialog.entries = cap(dialog.entries, LIMITS.dialog)
-
-    // Extract decisions
-    for (const d of extractPatterns(cleanText, RE_DECISIONS)) {
-      if (!patterns.decisions.includes(d)) patterns.decisions.push(d)
-    }
-    patterns.decisions = cap(patterns.decisions, LIMITS.decisions)
-
-    // Extract knowledge
-    for (const f of extractKnowledge(cleanText, pendingToolOutputs)) {
-      if (!knowledge.facts.some((k) => k.text === f)) {
-        knowledge.facts.push({ text: f, at: new Date().toISOString(), source: role })
-      }
-    }
-    knowledge.facts = cap(knowledge.facts, LIMITS.knowledge)
-
-    // Extract file paths
-    const files = extractFilePaths(cleanText)
-    dirty = true
-    return { decisions: [], facts: [], files }
-  }
-
-  async function pushAssistantReply(rawText, toolCalls, sessionID, messageID, model, agent) {
-    const text = short(repairMojibake(rawText), 800)
-    assistantReplies.replies.push({
-      text,
-      toolCalls,
-      sessionID,
-      messageID,
-      model: model ? `${model.providerID}/${model.modelID}` : undefined,
-      agent: agent || undefined,
-      at: new Date().toISOString(),
-    })
-    assistantReplies.replies = cap(assistantReplies.replies, LIMITS.assistantReplies)
-    dirty = true
-  }
-
-  async function pushFileChange(file, sessionID) {
-    fileChanges.changes.push({ file, sessionID, at: new Date().toISOString() })
-    fileChanges.changes = cap(fileChanges.changes, LIMITS.fileChanges)
-    currentSessionFiles.add(file)
-    dirty = true
-  }
-
-  async function pushTodos(sessionID, todoList) {
-    todos.snapshots.push({ sessionID, todos: todoList, at: new Date().toISOString() })
-    todos.snapshots = cap(todos.snapshots, LIMITS.todos)
-    dirty = true
-  }
-
-  async function pushSessionError(sessionID, errorName, errorMessage, sessionIDShort) {
-    sessionErrors.errors.push({
-      sessionID,
-      type: errorName,
-      message: errorMessage,
-      at: new Date().toISOString(),
-    })
-    sessionErrors.errors = cap(sessionErrors.errors, LIMITS.sessionErrors)
-    dirty = true
-  }
-
-  async function flush() {
-    if (!dirty) return
-    context = autoSummarize(actions.items, dialog.entries, patterns, sessionErrors.errors, assistantReplies.replies, todos)
-    context.updatedAt = new Date().toISOString()
-
-    // Update files edited in current sessions
-    for (const s of sessions.history) {
-      if (s.status === "active" && s.id) {
-        // Merge accumulated files
-      }
-    }
-
-    await Promise.all([
-      atomicWrite(FILES.actions, actions),
-      atomicWrite(FILES.dialog, dialog),
-      atomicWrite(FILES.context, context),
-      atomicWrite(FILES.patterns, patterns),
-      atomicWrite(FILES.knowledge, knowledge),
-      atomicWrite(FILES.sessions, sessions),
-      atomicWrite(FILES.fileChanges, fileChanges),
-      atomicWrite(FILES.todos, todos),
-      atomicWrite(FILES.sessionErrors, sessionErrors),
-      atomicWrite(FILES.assistantReplies, assistantReplies),
-    ])
-    dirty = false
-  }
-
-  // ─── Memory query tools ─────────────────────────────────────
-
-  function getMemory(query, options = {}) {
-    const q = String(query).toLowerCase()
-    const results = { actions: [], dialog: [], decisions: [], knowledge: [], files: [], errors: [], todos: [] }
-
-    // Search actions
-    for (const a of actions.items) {
-      if (a.summary.toLowerCase().includes(q) || JSON.stringify(a.meta).toLowerCase().includes(q)) {
-        results.actions.push(a)
-      }
-    }
-
-    // Search dialog
-    for (const d of dialog.entries) {
-      if (d.text.toLowerCase().includes(q)) results.dialog.push(d)
-    }
-
-    // Search decisions
-    for (const d of patterns.decisions) {
-      if (d.toLowerCase().includes(q)) results.decisions.push(d)
-    }
-
-    // Search knowledge
-    for (const k of knowledge.facts) {
-      if (k.text.toLowerCase().includes(q)) results.knowledge.push(k)
-    }
-
-    // Search file changes
-    for (const f of fileChanges.changes) {
-      if (f.file.toLowerCase().includes(q)) results.files.push(f)
-    }
-
-    // Search errors
-    for (const e of patterns.errors) {
-      if (e.toLowerCase().includes(q)) results.errors.push(e)
-    }
-
-    // Search todos
-    for (const snap of todos.snapshots) {
-      for (const t of snap.todos || []) {
-        if (t.content.toLowerCase().includes(q)) results.todos.push(t)
-      }
-    }
-
-    // Trim result sets
-    for (const key of Object.keys(results)) {
-      results[key] = results[key].slice(-options.max || 10)
-    }
-
-    return results
-  }
-
-  function getDecisions() {
-    return { decisions: patterns.decisions.slice(-20), recurring: patterns.recurring, recentErrors: patterns.errors.slice(-10) }
-  }
-
-  function getFileHistory(fileQuery = "") {
-    const changes = fileQuery
-      ? fileChanges.changes.filter((c) => c.file.toLowerCase().includes(fileQuery.toLowerCase()))
-      : fileChanges.changes
-    const byFile = {}
-    for (const c of changes) {
-      if (!byFile[c.file]) byFile[c.file] = []
-      byFile[c.file].push({ sessionID: c.sessionID, at: c.at })
-    }
-    return { total: changes.length, byFile: Object.fromEntries(Object.entries(byFile).slice(-30)) }
-  }
-
-  function getSessionInfo(sessionID = null) {
-    if (!sessionID) {
-      return {
-        total: sessions.history.length,
-        active: sessions.history.filter((s) => s.status === "active").length,
-        recent: sessions.history.slice(-10),
-      }
-    }
-    const s = sessions.history.find((x) => x.id === sessionID || x.id.endsWith(sessionID))
-    if (!s) return { error: "session not found" }
-    return {
-      session: s,
-      actions: actions.items.filter((a) => a.meta.sessionID === s.id).slice(-20),
-      dialog: dialog.entries.filter((d) => d.meta?.sessionID === s.id).slice(-20),
-      fileChanges: fileChanges.changes.filter((c) => c.sessionID === s.id).slice(-20),
-      todos: todos.snapshots.filter((t) => t.sessionID === s.id).slice(-5),
-    }
-  }
-
-  function getErrors() {
-    return {
-      sessionLevel: sessionErrors.errors.slice(-10),
-      actionLevel: patterns.errors.slice(-15),
-      recurring: patterns.recurring,
-    }
-  }
-
-  // ─── Tool definitions ──────────────────────────────────────
-
-  // zod-lite: define our own minimal arg-schema validation
   const tools = {
     memory_search: {
-      description: "Search persistent memory for any text pattern across actions, dialog, knowledge, files, errors, decisions",
-      args: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Text to search for" },
-          max: { type: "number", description: "Max results per category (default 10)" },
-        },
-        required: ["query"],
-      },
-      async execute(args, context) {
-        const results = getMemory(args.query, { max: args.max })
-        const lines = []
-        for (const [cat, items] of Object.entries(results)) {
-          if (items.length) {
-            lines.push(`## ${cat} (${items.length})`)
-            for (const item of items) {
-              if (typeof item === "string") lines.push(`  - ${item}`)
-              else lines.push(`  - ${short(JSON.stringify(item), 120)}`)
-            }
-          }
-        }
-        return lines.length ? lines.join("\n") : "No matches found."
-      },
+      description: "Search persistent memory across actions, dialog, replies, knowledge, files, errors. Supports time-range.",
+      args: { type: "object", properties: { query: { type: "string", description: "Text to search" }, max: { type: "number", description: "Max per category (default 10)" }, since: { type: "string", description: "ISO date after" }, until: { type: "string", description: "ISO date before" } }, required: ["query"] },
+      async execute(args) {
+        const q = `%${args.query}%`, max = args.max || 10, r = []
+        let acts = []
+        if (args.since) acts = stmts.gActionsRange.all(args.since, args.until || new Date().toISOString(), max)
+        else acts = stmts.sActions.all(q, q, max)
+        if (acts.length) { r.push("## Actions"); acts.forEach(a => r.push(`  [${a.type}] ${short(a.summary, 120)} (${fmt(a.created_at)})`)) }
+        const dlg = stmts.sDialog.all(q, max); if (dlg.length) { r.push("## Dialog"); dlg.forEach(d => r.push(`  - ${short(d.text, 120)} (${fmt(d.created_at)})`)) }
+        const rep = stmts.sReplies.all(q, max); if (rep.length) { r.push("## Replies"); rep.forEach(r2 => r.push(`  - ${short(r2.text, 100)} (${fmt(r2.created_at)})`)) }
+        const kn = stmts.sKnowledge.all(q, max); if (kn.length) { r.push("## Knowledge"); kn.forEach(k => r.push(`  - ${short(k.fact, 140)}`)) }
+        let fil = []
+        if (args.since) fil = stmts.gFilesRange.all(args.since, args.until || new Date().toISOString(), max)
+        else fil = stmts.sFiles.all(q, max)
+        if (fil.length) { r.push("## Files"); fil.forEach(f => r.push(`  ${f.file} [${f.change_type}]${f.additions > 0 ? ` +${f.additions}` : ""} (${fmt(f.created_at)})`)) }
+        let errs = []
+        if (args.since) errs = stmts.gErrorsRange.all(args.since, args.until || new Date().toISOString(), max)
+        else errs = stmts.sErrors.all(q, max)
+        if (errs.length) { r.push("## Errors"); errs.forEach(e => r.push(`  [${e.error_type}] ${short(e.message, 100)} (${fmt(e.created_at)})`)) }
+        return r.length ? r.join("\n") : "No matches found."
+      }
     },
     memory_decisions: {
-      description: "Get all recorded decisions, recurring issues, and recent errors from persistent memory",
+      description: "All recorded decisions, recurring issues, error stats",
       args: { type: "object", properties: {} },
       async execute() {
-        const d = getDecisions()
-        return [
-          "## Decisions",
-          ...d.decisions.map((d) => `  - ${d}`),
-          `## Recurring issues (${d.recurring.length})`,
-          ...d.recurring.map((r) => `  - ${r}`),
-          `## Recent errors (${d.recentErrors.length})`,
-          ...d.recentErrors.map((e) => `  - ${short(e, 100)}`),
-        ].join("\n")
-      },
+        const dec = stmts.gDecisions.all(20), et = stmts.gErrorsByType.all(10), as = stmts.gActionsByType.all(5), l = []
+        if (dec.length) { l.push("## Decisions"); dec.forEach(d => l.push(`  - ${d.value} (${d.count}x)`)) }
+        if (et.length) { l.push("## Error frequency"); et.forEach(e => l.push(`  [${e.count}x] ${e.error_type} (last: ${fmt(e.last_seen)})`)) }
+        l.push("## Action stats"); as.forEach(a => l.push(`  ${a.type}: ${a.count}`))
+        return l.join("\n")
+      }
     },
     memory_files: {
-      description: "Get file change history from persistent memory — which files were edited, when, in which sessions",
-      args: {
-        type: "object",
-        properties: {
-          query: { type: "string", description: "Optional file path filter" },
-        },
-      },
+      description: "File change history with optional filter. aggregate=true for grouped stats.",
+      args: { type: "object", properties: { query: { type: "string", description: "File path filter" }, aggregate: { type: "boolean", description: "Group by file" } } },
       async execute(args) {
-        const data = getFileHistory(args.query)
-        const lines = [`Total file changes tracked: ${data.total}`]
-        for (const [file, events] of Object.entries(data.byFile)) {
-          lines.push(`  ${file}: ${events.length} edits, latest ${events[events.length - 1]?.at || "?"}`)
-        }
-        return lines.join("\n")
-      },
+        if (args.aggregate) return stmts.gFilesAgg.all(30).map(f => `${f.file}: ${f.edits} edits, +${f.total_add || 0} -${f.total_del || 0} (${fmt(f.last_edit)})`).join("\n")
+        const q = args.query ? `%${args.query}%` : "%"
+        return stmts.sFiles.all(q, 30).map(f => `${f.file} [${f.change_type}] +${f.additions} -${f.deletions} (${fmt(f.created_at)})`).join("\n")
+      }
     },
     memory_errors: {
-      description: "Get recent errors from persistent memory — both session-level and tool-level",
-      args: { type: "object", properties: {} },
-      async execute() {
-        const e = getErrors()
-        const lines = []
-        if (e.sessionLevel.length) {
-          lines.push("## Session errors")
-          for (const err of e.sessionLevel) lines.push(`  [${err.type}] ${short(err.message, 100)}`)
-        }
-        if (e.actionLevel.length) {
-          lines.push("## Action errors")
-          for (const err of e.actionLevel) lines.push(`  - ${short(err, 100)}`)
-        }
-        if (e.recurring.length) {
-          lines.push("## Recurring")
-          for (const r of e.recurring) lines.push(`  - ${short(r, 80)}`)
-        }
-        return lines.join("\n") || "No errors recorded."
-      },
+      description: "Recent errors — session-level, tool-level, grouped by type. Supports time-range.",
+      args: { type: "object", properties: { since: { type: "string", description: "ISO date after" } } },
+      async execute(args) {
+        const se = args.since ? stmts.gErrorsRange.all(args.since, new Date().toISOString(), 20) : stmts.gSessionErrors.all(20)
+        const et = stmts.gErrorsByType.all(10), ea = stmts.gErrorActions.all(10), l = []
+        if (se.length) { l.push("## Session errors"); se.slice(0, 10).forEach(e => l.push(`  [${e.error_type}] ${short(e.message, 100)} (${fmt(e.created_at)})`)) }
+        if (ea.length) { l.push("## Tool errors"); ea.slice(0, 5).forEach(e => l.push(`  - ${short(e.summary, 100)}`)) }
+        if (et.length) { l.push("## Frequency"); et.forEach(b => l.push(`  [${b.count}x] ${b.error_type}`)) }
+        return l.join("\n") || "No errors recorded."
+      }
     },
     memory_sessions: {
-      description: "Get session information and history from persistent memory",
-      args: {
-        type: "object",
-        properties: {
-          sessionID: { type: "string", description: "Optional session ID to get detailed info for" },
-        },
-      },
+      description: "Session history, cross-session chains by project, per-session details",
+      args: { type: "object", properties: { sessionID: { type: "string", description: "Session ID or last 6 chars" } } },
       async execute(args) {
-        return JSON.stringify(getSessionInfo(args.sessionID), null, 2)
-      },
+        if (args.sessionID) {
+          const all = stmts.gSessions.all(100), f = all.find(s => s.id === args.sessionID || s.id.endsWith(args.sessionID))
+          if (!f) return `Not found. ${all.length} known.`
+          return JSON.stringify({ session: f, model: f.model_id ? `${f.model_provider}/${f.model_id}` : null, agent: f.agent }, null, 2)
+        }
+        const act = stmts.gSessions.all(30).filter(s => s.status === "active"), chain = stmts.gSessionChain.all(projectDir, 10)
+        const l = [`Total: ${act.length} active sessions`, `Project: ${projectDir}`]
+        if (chain.length) { l.push("## Chain:"); chain.forEach(s => { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; l.push(`  ${s.id.slice(-8)} ${s.status}${m}`) }) }
+        return l.join("\n")
+      }
     },
   }
-
-  // ─── Hook handlers ─────────────────────────────────────────
 
   return {
-    // ── Query tools exposed to LLM ──
     tool: tools,
 
-    /**
-     * Inject full memory digest into system prompt.
-     */
-    async "experimental.chat.system.transform"(input, output) {
-      const digest = buildDigest({ identity, sessions, actions, dialog, context, patterns, knowledge, fileChanges, todos, sessionErrors, assistantReplies })
-      output.system.push(`\n---\n${digest}\n---\n`)
+    "experimental.chat.system.transform" : async (input, output) => {
+      try { output.system.push(`\n---\n${await buildDigest()}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4] Error: ${e.message}\n---\n`) }
     },
 
-    /**
-     * Capture user message.
-     */
-    async "chat.message"(input, output) {
+    "chat.message": async (input, output) => {
       const text = textFromParts(output.parts)
-      if (text) {
-        await pushDialog(text, "user")
-        await flush()
-      }
+      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID); await flush() }
     },
 
-    /**
-     * Log tool execution with accurate error detection.
-     */
-    async "tool.execute.after"(input, output) {
-      const result = output.output || ""
-      const isErr = isGenuineError(input.tool, result)
-      await pushAction(isErr ? "error" : "action", `${input.tool}: ${short(result, 120)}`, {
-        sessionID: input.sessionID,
-        tool: input.tool,
-        callID: input.callID,
-      })
-      pendingToolOutputs.push(result)
-      if (pendingToolOutputs.length > 5) pendingToolOutputs = pendingToolOutputs.slice(-5)
+    "tool.execute.after": async (input, output) => {
+      const result = output.output || "", isErr = isGenuineError(input.tool, result)
+      await rAction(isErr ? "error" : "action", `${input.tool}: ${short(result, 120)}`, input.sessionID, input.tool, input.callID)
+      pendingToolOutputs.push(result); if (pendingToolOutputs.length > 5) pendingToolOutputs = pendingToolOutputs.slice(-5)
       await flush()
     },
 
-    /**
-     * Protect context during compaction.
-     */
-    async "experimental.session.compacting"(input, output) {
-      output.context.push(
-        "[AUTONOMOUS PERSISTENCE v3] Session is being compacted. You MUST preserve:\n" +
-        "(1) ALL key decisions and their rationale\n" +
-        "(2) All unresolved errors with root causes\n" +
-        "(3) Explicit next steps and pending tasks\n" +
-        "(4) Important file paths and configurations\n" +
-        "(5) User preferences, conventions, and constraints\n" +
-        "(6) What tools/commands were executed and their results\n" +
-        "The next context window depends on this summary."
-      )
+    "experimental.session.compacting": async (input, output) => {
+      output.context.push("[PERSISTENCE v4] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
       await flush()
     },
 
-    /**
-     * Main event handler — captures everything.
-     */
-    async event({ event }) {
-      const type = event.type
-
-      // ── Session lifecycle ──
-      if (type === "session.created") {
-        const info = event.properties?.info
-        const sessionID = info?.id || event.properties?.sessionID
-        if (sessionID) {
-          sessions.history.push({
-            id: sessionID,
-            startedAt: new Date().toISOString(),
-            status: "active",
-            agent: info?.agent,
-            model: info?.model ? { providerID: info.model.providerID, modelID: info.model.modelID } : undefined,
-          })
-          sessions.history = cap(sessions.history, LIMITS.sessions)
-          dirty = true
-          await flush()
+    event: async ({ event }) => {
+      switch (event.type) {
+        case "session.created": {
+          const info = event.properties?.info, sid = info?.id || event.properties?.sessionID
+          if (sid) await rSession(sid, info?.agent, info?.model, projectDir)
+          break
         }
-      }
-
-      if (type === "session.deleted" || type === "session.compacted") {
-        const sessionID = event.properties?.sessionID
-        if (sessionID) {
-          const idx = sessions.history.findIndex((s) => s.id === sessionID)
-          if (idx >= 0) {
-            sessions.history[idx].status = type === "session.deleted" ? "deleted" : "compacted"
-            sessions.history[idx].endedAt = new Date().toISOString()
-            // Save files edited in this session
-            if (currentSessionFiles.size) {
-              sessions.history[idx].filesEdited = [...currentSessionFiles]
-            }
-          }
-          await flush()
+        case "session.deleted": case "session.compacted": {
+          const sid = event.properties?.sessionID
+          if (sid) await rCloseSession(sid, event.type === "session.deleted" ? "deleted" : "compacted")
+          break
         }
-      }
-
-      // ── Assistant message capture ──
-      if (type === "message.updated") {
-        const info = event.properties?.info
-        if (info?.role === "assistant") {
-          // Assistant finished (has completed timestamp)
-          if (info.time?.completed) {
-            // Extract text and tool calls from messageParts event (parts come separately)
-            // For now, capture what we have
-            const sessionID = info.sessionID
-            const messageID = info.id
-            const model = { providerID: info.providerID, modelID: info.modelID }
-
-            // Check for assistant error
-            if (info.error) {
-              await pushSessionError(sessionID, info.error.name, info.error.data?.message || "Unknown error")
-            }
-          }
+        case "message.updated": {
+          const info = event.properties?.info
+          if (info?.role === "assistant" && info.time?.completed && info.error)
+            await rSessionError(info.sessionID, info.error.name, info.error.data?.message || "Unknown")
+          break
         }
-      }
-
-      // ── Message parts (assistant text + tools) ──
-      if (type === "message.part.updated") {
-        const part = event.properties?.part
-        if (part && part.type === "text" && part.sessionID) {
-          // We get text parts — accumulate them per message
-          // This is streaming so we get deltas; we capture the final state
+        case "message.part.updated": {
+          const part = event.properties?.part
+          if (!part) break
+          if (part.type === "snapshot" && part.snapshot) await rSnapshot(part.sessionID, part.messageID, part.snapshot)
+          if (part.type === "patch" && part.hash) await rPatch(part.sessionID, part.messageID, part.hash, part.files || [])
+          break
         }
-      }
-
-      // ── File edited ──
-      if (type === "file.edited") {
-        const file = event.properties?.file
-        if (file) {
-          await pushFileChange(file, event.properties?.sessionID)
-          await flush()
+        case "file.edited": {
+          const file = event.properties?.file
+          if (file) { currentSessionFiles.add(file); await rFileChange(file, event.properties?.sessionID, "edit", 0, 0); await flush() }
+          break
         }
-      }
-
-      // ── Session diff (final diff per session) ──
-      if (type === "session.diff") {
-        const sessionID = event.properties?.sessionID
-        const diffs = event.properties?.diff || []
-        if (sessionID && diffs.length) {
-          const fileList = diffs.map((d) => `${d.file} (+${d.additions}/-${d.deletions})`).join(", ")
-          dirty = true
+        case "session.diff": {
+          const diffs = event.properties?.diff || [], sid = event.properties?.sessionID
+          if (sid && diffs.length) { for (const d of diffs) await rFileChange(d.file, sid, "diff", d.additions || 0, d.deletions || 0); await flush() }
+          break
         }
-      }
-
-      // ── Todo state capture ──
-      if (type === "todo.updated") {
-        const sessionID = event.properties?.sessionID
-        const todoList = event.properties?.todos
-        if (sessionID && todoList) {
-          await pushTodos(sessionID, todoList)
-          await flush()
+        case "todo.updated": {
+          const sid = event.properties?.sessionID, tl = event.properties?.todos
+          if (sid && tl) { await rTodos(sid, tl); await flush() }
+          break
         }
-      }
-
-      // ── Session errors ──
-      if (type === "session.error") {
-        const sessionID = event.properties?.sessionID
-        const err = event.properties?.error
-        if (err) {
-          await pushSessionError(sessionID, err.name, err.data?.message || JSON.stringify(err.data).slice(0, 200))
-          await flush()
+        case "session.error": {
+          const err = event.properties?.error, sid = event.properties?.sessionID
+          if (err) { await rSessionError(sid, err.name, err.data?.message || JSON.stringify(err.data).slice(0, 300)); await flush() }
+          break
         }
-      }
-
-      // ── Permission replies (user decisions on asks) ──
-      if (type === "permission.replied") {
-        const response = event.properties?.response
-        if (response) {
-          // Track that a permission was asked and what was decided
-          dirty = true
-        }
-      }
-
-      // ── File watcher ──
-      if (type === "file.watcher.updated") {
-        // Could track external file changes — high volume, skip for now
       }
     },
 
-    /**
-     * Final persist on shutdown.
-     */
     async dispose() {
+      if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
       await flush()
+      if (db) { db.close(); db = null }
     },
   }
 }
 
-export default {
-  id: "opencode-persistence-autonomous",
-  server: PersistencePlugin,
-}
+export default { id: "opencode-persistence-autonomous", server: PersistencePlugin }

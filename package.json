@@ -1,7 +1,7 @@
 {
   "name": "opencode-persistence",
-  "version": "3.0.0",
-  "description": "Full self-aware autonomous memory system for opencode — captures user/assistant/file/todo/error state, queryable via tools, zero interaction",
+  "version": "4.0.0",
+  "description": "SQLite-backed autonomous memory for opencode v4.0 — single DB, WAL mode, mutex-protected, queryable via memory_* tools, zero interaction",
   "main": "index.js",
   "type": "module",
   "exports": {
@@ -27,5 +27,8 @@
     "error-detection",
     "tool-registry"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3"
+  }
 }
