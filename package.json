@@ -1,7 +1,7 @@
 {
   "name": "opencode-persistence",
-  "version": "2.0.0",
-  "description": "Autonomous persistent memory and handoff plugin for opencode — zero-interaction memory loop with smart extraction",
+  "version": "3.0.0",
+  "description": "Full self-aware autonomous memory system for opencode — captures user/assistant/file/todo/error state, queryable via tools, zero interaction",
   "main": "index.js",
   "type": "module",
   "exports": {
@@ -21,7 +21,11 @@
     "persistence",
     "session",
     "handoff",
-    "autonomous"
+    "autonomous",
+    "self-aware",
+    "file-tracking",
+    "error-detection",
+    "tool-registry"
   ],
   "license": "MIT"
 }
