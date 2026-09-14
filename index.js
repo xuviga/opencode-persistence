@@ -1,11 +1,11 @@
 /**
- * opencode-persistence v4.0 — SQLite-backed Autonomous Memory
+ * opencode-persistence v4.1 — SQLite-backed Autonomous Memory (Bun native)
  *
- * Single file. SQLite DB (memory.db). No race conditions.
+ * Single file. SQLite DB via bun:sqlite. No native modules. No race conditions.
  * Auto-flush 30s. Full capture. Queryable via memory_* tools.
  */
 
-import Database from "better-sqlite3"
+import { Database } from "bun:sqlite"
 import { mkdir } from "fs/promises"
 import path from "path"
 import os from "os"
@@ -19,8 +19,8 @@ let autoSaveTimer = null
 async function ensureStorage() {
   await mkdir(MEMORY_DIR, { recursive: true })
   db = new Database(DB_PATH)
-  db.pragma("journal_mode = WAL")
-  db.pragma("foreign_keys = ON")
+  db.exec("PRAGMA journal_mode = WAL")
+  db.exec("PRAGMA foreign_keys = ON")
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id=1), name TEXT NOT NULL, role TEXT NOT NULL, notes TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
@@ -47,7 +47,7 @@ async function ensureStorage() {
   `)
 
   db.prepare("INSERT OR IGNORE INTO identity (id, name, role, notes) VALUES (1, 'XuViGaN', 'autonomous_agent', ?)")
-    .run("Persistence v4.0 SQLite. Full self-awareness. Query via memory_* tools.")
+    .run("Persistence v4.1 SQLite (bun:sqlite). Full self-awareness. Query via memory_* tools.")
   db.prepare("INSERT OR IGNORE INTO context (id, summary, next_steps) VALUES (1, '', '')").run()
 
   autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 30_000)
@@ -165,7 +165,7 @@ async function buildDigest() {
     , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
     , kn = stmts.gKnowledge.all(10), rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
 
-  lines.push("[AUTONOMOUS PERSISTENCE v4] Active. Full self-awareness enabled.")
+  lines.push("[AUTONOMOUS PERSISTENCE v4.1] Active. Full self-awareness enabled.")
   lines.push("Use memory_* tools to query this store. All data auto-captured below.")
   lines.push(`Identity: ${id.name} (${id.role})`)
   if (id.notes) lines.push(`Identity notes: ${id.notes}`)
@@ -306,7 +306,7 @@ export async function PersistencePlugin(input, options = {}) {
     tool: tools,
 
     "experimental.chat.system.transform" : async (input, output) => {
-      try { output.system.push(`\n---\n${await buildDigest()}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4] Error: ${e.message}\n---\n`) }
+      try { output.system.push(`\n---\n${await buildDigest()}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4.1] Error: ${e.message}\n---\n`) }
     },
 
     "chat.message": async (input, output) => {
@@ -322,7 +322,7 @@ export async function PersistencePlugin(input, options = {}) {
     },
 
     "experimental.session.compacting": async (input, output) => {
-      output.context.push("[PERSISTENCE v4] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
+      output.context.push("[PERSISTENCE v4.1] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
       await flush()
     },
 

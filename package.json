@@ -1,7 +1,7 @@
 {
   "name": "opencode-persistence",
-  "version": "4.0.0",
-  "description": "SQLite-backed autonomous memory for opencode v4.0 — single DB, WAL mode, mutex-protected, queryable via memory_* tools, zero interaction",
+  "version": "4.1.0",
+  "description": "SQLite-backed autonomous memory for opencode v4.1 — bun:sqlite native, no external deps, mutex-protected, queryable via memory_* tools",
   "main": "index.js",
   "type": "module",
   "exports": {
@@ -28,7 +28,5 @@
     "tool-registry"
   ],
   "license": "MIT",
-  "dependencies": {
-    "better-sqlite3": "^13.0.3"
-  }
+  "dependencies": {}
 }
