@@ -1,0 +1,9 @@
+{
+  "name": "opencode-persistence",
+  "version": "1.0.0",
+  "description": "Persistent memory and handoff plugin for opencode",
+  "main": "index.js",
+  "exports": {
+    "./server": "./index.js"
+  }
+}
