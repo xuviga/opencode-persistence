@@ -1,9 +1,27 @@
 {
   "name": "opencode-persistence",
-  "version": "1.0.0",
-  "description": "Persistent memory and handoff plugin for opencode",
+  "version": "2.0.0",
+  "description": "Autonomous persistent memory and handoff plugin for opencode — zero-interaction memory loop with smart extraction",
   "main": "index.js",
+  "type": "module",
   "exports": {
     "./server": "./index.js"
-  }
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "$schema": "https://json.schemastore.org/package.json",
+  "files": [
+    "index.js"
+  ],
+  "keywords": [
+    "opencode",
+    "plugin",
+    "memory",
+    "persistence",
+    "session",
+    "handoff",
+    "autonomous"
+  ],
+  "license": "MIT"
 }

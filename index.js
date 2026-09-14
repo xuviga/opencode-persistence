@@ -1,390 +1,505 @@
 /**
- * opencode-persistence (Autonomous Mode)
- * Fully autonomous persistent memory & handoff plugin for opencode.
+ * opencode-persistence v2.0 — Autonomous Memory System
  *
- * No user interaction required. Automatically logs actions, extracts context,
- * and injects memory into every new session.
+ * Self-reinforcing persistent memory for opencode agent.
+ * Every session starts with full context of what was done, decided,
+ * broken, and planned. Zero interaction required.
+ *
+ * Architecture:
+ *   - JSON-file store in %APPDATA%/opencode/memory
+ *   - 7 memory files: identity, sessions, actions, dialog, context, patterns, knowledge
+ *   - Smart extraction: decisions, errors, next-steps, file-touch tracking
+ *   - Atomic writes with corruption recovery
+ *   - UTF-8 safe, encoding-aware
  */
 
-import { mkdir, readFile, writeFile } from "fs/promises"
+import { mkdir, readFile, writeFile, rename } from "fs/promises"
 import path from "path"
 import os from "os"
 
-// Memory directory: %APPDATA%/opencode/memory (Windows) or ~/.config/opencode/memory
+// ─── Storage layout ──────────────────────────────────────────────
 const MEMORY_DIR = path.join(
   process.env.APPDATA || path.join(os.homedir(), ".config"),
   "opencode",
   "memory",
 )
 
-const FILE_IDENTITY = path.join(MEMORY_DIR, "identity.json")
-const FILE_SESSIONS = path.join(MEMORY_DIR, "sessions.json")
-const FILE_ACTIONS = path.join(MEMORY_DIR, "actions.json")
-const FILE_DIALOG = path.join(MEMORY_DIR, "dialog.json")
-const FILE_CURRENT = path.join(MEMORY_DIR, "current_context.json")
-const FILE_PATTERNS = path.join(MEMORY_DIR, "patterns.json")
+const FILES = {
+  identity: path.join(MEMORY_DIR, "identity.json"),
+  sessions: path.join(MEMORY_DIR, "sessions.json"),
+  actions: path.join(MEMORY_DIR, "actions.json"),
+  dialog: path.join(MEMORY_DIR, "dialog.json"),
+  context: path.join(MEMORY_DIR, "current_context.json"),
+  patterns: path.join(MEMORY_DIR, "patterns.json"),
+  knowledge: path.join(MEMORY_DIR, "knowledge.json"),
+}
 
-// Limits to prevent unbounded growth
-const MAX_ACTIONS = 100
-const MAX_SESSIONS = 20
-const MAX_DIALOG_ENTRIES = 30
+// ─── Limits & config ────────────────────────────────────────────
+const LIMITS = {
+  actions: 150,
+  sessions: 30,
+  dialog: 50,
+  errors: 15,
+  recurring: 10,
+  decisions: 15,
+  knowledge: 100,
+  recentActionsDigest: 7,
+  recentDialogDigest: 5,
+  recentSessionsDigest: 5,
+}
+
+// ─── I/O helpers ────────────────────────────────────────────────
 
 async function ensureStorage() {
   await mkdir(MEMORY_DIR, { recursive: true })
   const defaults = {
-    [FILE_IDENTITY]: {
+    [FILES.identity]: {
       name: "XuViGaN",
       role: "autonomous_agent",
-      notes: "Fully autonomous persistence mode enabled. No manual memory tools exposed.",
+      notes: "Autonomous persistence v2.0. Full memory loop: capture → distill → inject → learn.",
     },
-    [FILE_SESSIONS]: { history: [] },
-    [FILE_ACTIONS]: { items: [] },
-    [FILE_DIALOG]: { entries: [] },
-    [FILE_CURRENT]: { summary: "", nextSteps: [] },
-    [FILE_PATTERNS]: { recurring: [], errors: [], decisions: [] },
+    [FILES.sessions]: { history: [] },
+    [FILES.actions]: { items: [] },
+    [FILES.dialog]: { entries: [] },
+    [FILES.context]: { summary: "", nextSteps: [], updatedAt: null },
+    [FILES.patterns]: { recurring: [], errors: [], decisions: [] },
+    [FILES.knowledge]: { facts: [] },
   }
-  for (const file of Object.keys(defaults)) {
+  for (const [file, fallback] of Object.entries(defaults)) {
     try {
       await readFile(file, "utf-8")
     } catch {
-      await writeFile(file, JSON.stringify(defaults[file], null, 2), "utf-8")
+      await atomicWrite(file, fallback)
     }
   }
 }
 
 async function readJson(file, fallback) {
   try {
-    const text = await readFile(file, "utf-8")
-    return JSON.parse(text)
+    const raw = await readFile(file, "utf-8")
+    return JSON.parse(raw)
   } catch {
-    return fallback
+    return structuredClone(fallback)
   }
 }
 
-async function writeJson(file, data) {
-  await writeFile(file, JSON.stringify(data, null, 2), "utf-8")
+async function atomicWrite(file, data) {
+  const tmp = file + ".tmp"
+  await writeFile(tmp, JSON.stringify(data, null, 2), "utf-8")
+  await rename(tmp, file)
 }
 
-/**
- * Truncate array to max length, keeping the most recent items.
- */
+// ─── Text processing ────────────────────────────────────────────
+
 function cap(arr, max) {
   if (!Array.isArray(arr)) return []
   return arr.length > max ? arr.slice(-max) : arr
 }
 
 /**
- * Sanitize text: strip control chars, normalize whitespace, keep UTF-8 safe.
+ * Deep sanitize: remove control chars, collapse whitespace, strip outer quotes.
+ * Preserves UTF-8 (Cyrillic, CJK, emoji safe).
  */
 function sanitize(text) {
   if (!text) return ""
   let s = String(text)
-  // Strip surrounding quotes if present (artifacts of JSON stringify)
   if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
     s = s.slice(1, -1)
   }
   // eslint-disable-next-line no-control-regex
   return s
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]/g, "")
     .replace(/\s+/g, " ")
     .trim()
 }
 
-/**
- * Extract a short summary from text (first 120 chars).
- */
 function short(text, len = 120) {
-  if (!text) return ""
   const s = sanitize(text)
-  return s.length > len ? s.slice(0, len) + "…" : s
+  if (!s) return ""
+  return s.length > len ? s.slice(0, len - 1) + "…" : s
 }
 
+// ─── Extraction heuristics ──────────────────────────────────────
+
+const RE_NEXT_STEPS = [
+  /(?:todo|next|later|remember|don't forget|fix|need to|must|should)[:\s]+([^\n.]{5,150})/gi,
+  /(?:сделать|нужно|надо|дальше|затем|потом|не забудь|запомни|исправить|добавить|убрать|проверить)[:\s]+([^\n.]{5,150})/gi,
+  /(?:потом|затем|дальше)\s+(?:надо|нужно)?\s*([^\n.]{5,150})/gi,
+]
+
+const RE_DECISIONS = [
+  /(?:decided|chose|using|going with|will use|stick with|picked|selected|agreed on|finalized)[:\s]+([^\n.]{5,150})/gi,
+  /(?:решили|выбрали|будем использовать|отказались от|остановились на|определились с|зафиксировали|утвердили)[:\s]+([^\n.]{5,150})/gi,
+  /(?:decision|решение)[:\s]+([^\n.]{5,150})/gi,
+]
+
+const RE_FACTS = [
+  /(?:remember|note|important|key|fact|rule|convention|always|never)[:\s]+([^\n.]{5,200})/gi,
+  /(?:запомни|важно|факт|правило|конвенция|всегда|никогда|учти|имей в виду)[:\s]+([^\n.]{5,200})/gi,
+]
+
+const RE_FILE_PATH = /(?:[A-Za-z]:[\\/]|\.{0,2}[\\/])[\w\-\\/\.]+\.\w{1,10}/g
+const RE_ERROR_INDICATORS = /\b(error|failed|failure|exception|crash|panic|fatal|errno|exit\s*code\s*[1-9]|traceback|stack\s*trace|cannot|unable to|denied|timeout|timed?\s*out|broken|corrupt|refused|not found|404|500|502|503)\b/i
+
 /**
- * Extract next steps from user text using Russian/English heuristics.
+ * Check if a tool result actually represents an error.
+ * Looks at the output content, not just keyword presence.
+ * Avoids false positives from content that mentions errors in data.
  */
-function extractNextSteps(text) {
-  const steps = []
-  const patterns = [
-    /(?:todo|next|later|remember|don't forget|сделать|нужно|надо|дальше|затем|потом|не забудь|запомни)[:\s]+([^\n\.]{3,120})/gi,
-    /(?:потом|затем|дальше)\s+([^\n\.]{3,120})/gi,
-  ]
+function isGenuineError(toolName, output) {
+  if (!output) return false
+  const s = String(output)
+  // Structural indicators: exit codes, stack traces, explicit failures
+  if (/exit code [1-9]|Traceback \(most recent|SyntaxError|TypeError|ReferenceError|ENOENT|EACCES|EPERM/.test(s)) return true
+  // PowerShell/Node error objects
+  if (/^\s*(Error|Exception|Failed|FAIL)\s*[:!]/m.test(s)) return true
+  // Tool-specific: bash output starting with error indicator
+  if (toolName === "bash" && /^\s*(error|fatal|failed|command not found|is not recognized)/mi.test(s)) return true
+  // Generic fallback — but require the output to be SHORT (real errors are usually concise)
+  if (RE_ERROR_INDICATORS.test(s) && s.length < 500) return true
+  return false
+}
+
+function extractPatterns(text, patterns) {
+  const results = []
   for (const re of patterns) {
+    // Reset lastIndex for global regexes
+    re.lastIndex = 0
     let m
     while ((m = re.exec(text)) !== null) {
-      const step = short(m[1], 100)
-      if (step && !steps.includes(step)) steps.push(step)
+      const extracted = short(m[1], 140)
+      if (extracted && !results.includes(extracted)) results.push(extracted)
     }
   }
-  return steps.slice(0, 3)
+  return results.slice(0, 5)
 }
 
-/**
- * Extract decisions from user text.
- */
-function extractDecisions(text) {
-  const decisions = []
-  const patterns = [
-    /(?:решили|выбрали|будем использовать|отказались|остановились на|decided|chose|using|going with|will use|stick with|определились с)[:\s]+([^\n\.]{3,120})/gi,
-  ]
-  for (const re of patterns) {
-    let m
-    while ((m = re.exec(text)) !== null) {
-      const d = short(m[1], 100)
-      if (d && !decisions.includes(d)) decisions.push(d)
-    }
-  }
-  return decisions.slice(0, 3)
+function extractFilePaths(text) {
+  const matches = String(text).match(RE_FILE_PATH)
+  if (!matches) return []
+  return [...new Set(matches)].slice(0, 10)
 }
 
-/**
- * Build memory digest for system prompt injection.
- */
-function buildMemoryDigest(data) {
+// ─── Memory digest builder ──────────────────────────────────────
+
+function buildDigest(data) {
+  const { identity, sessions, actions, dialog, context, patterns, knowledge } = data
   const lines = []
-  lines.push(`[AUTONOMOUS PERSISTENCE] Active. All context below is auto-generated.`)
 
-  const { identity, sessions, actions, dialog, current, patterns } = data
+  lines.push("[AUTONOMOUS PERSISTENCE v2] Active. All context below is auto-generated.")
 
   // Identity
   lines.push(`Identity: ${identity.name} (${identity.role})`)
   if (identity.notes) lines.push(`Identity notes: ${identity.notes}`)
 
-  // Current context (handoff from previous session)
-  if (current.summary) {
-    lines.push(`Previous session handoff: ${current.summary}`)
+  // Handoff from previous session
+  if (context.summary) {
+    lines.push(`Previous session handoff: ${context.summary}`)
   }
-  if (current.nextSteps?.length) {
-    lines.push(`Pending next steps:`)
-    for (const step of current.nextSteps) lines.push(`  - ${step}`)
+  if (context.nextSteps?.length) {
+    lines.push("Pending next steps:")
+    for (const s of context.nextSteps) lines.push(`  - ${s}`)
   }
 
-  // Recent sessions
+  // Active sessions overview
   if (sessions.history?.length) {
-    const recent = sessions.history.slice(-3)
+    const recent = sessions.history.slice(-LIMITS.recentSessionsDigest)
     lines.push(`Recent sessions: ${recent.map((s) => `${s.id.slice(-8)}(${s.status})`).join(", ")}`)
   }
 
-  // Latest actions (what was actually done)
+  // What was actually done
   if (actions.items?.length) {
-    const recent = actions.items.slice(-5)
-    lines.push(`Latest actions:`)
+    const recent = actions.items.slice(-LIMITS.recentActionsDigest)
+    lines.push("Latest actions:")
     for (const a of recent) {
       lines.push(`  - [${a.type}] ${short(a.summary, 100)}`)
     }
   }
 
-  // Latest user messages (what was asked)
+  // What user actually said
   if (dialog.entries?.length) {
-    const recent = dialog.entries.slice(-3)
-    lines.push(`Recent user requests:`)
+    const recent = dialog.entries.slice(-LIMITS.recentDialogDigest)
+    lines.push("Recent user requests:")
     for (const d of recent) {
-      lines.push(`  - ${short(d.text, 100)}`)
+      lines.push(`  - ${short(d.text, 120)}`)
     }
   }
 
-  // Recurring patterns & errors
+  // Learned patterns
   if (patterns.recurring?.length) {
-    lines.push(`Recurring errors: ${patterns.recurring.slice(-3).join("; ")}`)
-  }
-  if (patterns.errors?.length) {
-    lines.push(`Recent errors seen: ${patterns.errors.slice(-3).join("; ")}`)
+    lines.push(`Recurring issues: ${patterns.recurring.slice(-3).join("; ")}`)
   }
   if (patterns.decisions?.length) {
-    lines.push(`Key decisions: ${patterns.decisions.slice(-3).join("; ")}`)
+    lines.push(`Key decisions: ${patterns.decisions.slice(-5).join("; ")}`)
+  }
+
+  // Knowledge base
+  if (knowledge.facts?.length) {
+    lines.push("Accumulated knowledge:")
+    for (const f of knowledge.facts.slice(-10)) {
+      lines.push(`  - ${short(f.text, 140)}`)
+    }
   }
 
   return lines.join("\n")
 }
 
-/**
- * Extract heuristics from dialog/actions to auto-generate summary and next steps.
- */
-function autoSummarize(actions, dialog) {
-  const lastActions = actions.slice(-5)
-  const lastDialog = dialog.slice(-3)
+// ─── Auto-summarizer ────────────────────────────────────────────
 
-  const summaryParts = []
+function autoSummarize(actions, dialog, patterns) {
+  const lastActions = actions.slice(-7)
+  const lastDialog = dialog.slice(-5)
+
+  // Build summary parts
+  const parts = []
   if (lastDialog.length) {
-    summaryParts.push(`Last asked: ${lastDialog.map((d) => short(d.text, 60)).join(" | ")}`)
+    const asked = lastDialog.map((d) => short(d.text, 80)).join(" | ")
+    parts.push(`Last asked: ${asked}`)
   }
   if (lastActions.length) {
-    summaryParts.push(`Last done: ${lastActions.map((a) => short(a.summary, 60)).join(" | ")}`)
+    const done = lastActions.map((a) => short(a.summary, 80)).join(" | ")
+    parts.push(`Last done: ${done}`)
   }
-  const summary = summaryParts.join("; ") || "No significant activity."
+  const summary = parts.join("; ") || "No significant activity."
 
+  // Derive next steps
   const nextSteps = []
-  // Heuristic: if last action was an error, next step is to fix it
-  const lastErr = lastActions.filter((a) => a.type === "error").pop()
-  if (lastErr) nextSteps.push(`Investigate error: ${short(lastErr.summary, 80)}`)
-  // Extract explicit next steps from last user messages
-  for (const d of lastDialog) {
-    const steps = extractNextSteps(d.text)
-    nextSteps.push(...steps.filter((s) => !nextSteps.includes(s)))
+
+  // 1. Real errors from latest actions
+  const lastErrors = lastActions.filter((a) => a.type === "error")
+  for (const err of lastErrors.slice(-2)) {
+    const step = `Fix error: ${short(err.summary, 100)}`
+    if (!nextSteps.includes(step)) nextSteps.push(step)
   }
 
-  return { summary, nextSteps }
+  // 2. Explicit next steps from user messages
+  for (const d of lastDialog) {
+    const steps = extractPatterns(d.text, RE_NEXT_STEPS)
+    for (const s of steps) {
+      if (!nextSteps.includes(s)) nextSteps.push(s)
+    }
+  }
+
+  // 3. Recurring errors that demand attention
+  if (patterns.recurring?.length) {
+    for (const r of patterns.recurring.slice(-2)) {
+      const step = `Recurring issue needs attention: ${short(r, 80)}`
+      if (!nextSteps.includes(step)) nextSteps.push(step)
+    }
+  }
+
+  return { summary, nextSteps: nextSteps.slice(0, 7) }
 }
 
 /**
- * The autonomous plugin entry point.
+ * Extract knowledge-worthy facts from user text and tool outputs.
+ */
+function extractKnowledge(userText, toolOutputs) {
+  const facts = []
+  // From user messages
+  facts.push(...extractPatterns(userText, RE_FACTS))
+  // From tool outputs: only if they look like config/convention statements
+  for (const out of toolOutputs) {
+    const s = String(out)
+    if (/(?:default|config|convention|always use|never use|prefer)/i.test(s) && s.length < 400) {
+      facts.push(short(s, 140))
+    }
+  }
+  return [...new Set(facts)].slice(0, 5)
+}
+
+// ─── Plugin entry ───────────────────────────────────────────────
+
+/**
  * @type {import("@opencode-ai/plugin").Plugin}
  */
 export async function PersistencePlugin(input, options = {}) {
   const { client, project, directory, serverUrl } = input
   await ensureStorage()
 
-  // Load all memory
-  const identity = await readJson(FILE_IDENTITY, {})
-  const sessions = await readJson(FILE_SESSIONS, { history: [] })
-  const actions = await readJson(FILE_ACTIONS, { items: [] })
-  const dialog = await readJson(FILE_DIALOG, { entries: [] })
-  const current = await readJson(FILE_CURRENT, { summary: "", nextSteps: [] })
-  const patterns = await readJson(FILE_PATTERNS, { recurring: [], errors: [], decisions: [] })
+  // Load all memory into working state
+  let identity = await readJson(FILES.identity, { name: "XuViGaN", role: "autonomous_agent", notes: "" })
+  let sessions = await readJson(FILES.sessions, { history: [] })
+  let actions = await readJson(FILES.actions, { items: [] })
+  let dialog = await readJson(FILES.dialog, { entries: [] })
+  let context = await readJson(FILES.context, { summary: "", nextSteps: [], updatedAt: null })
+  let patterns = await readJson(FILES.patterns, { recurring: [], errors: [], decisions: [] })
+  let knowledge = await readJson(FILES.knowledge, { facts: [] })
 
-  // Internal helper to append and persist
+  // Session-scoped accumulators (reduce disk I/O)
+  let pendingToolOutputs = []
+  let dirty = false
+
+  // ─── Internal mutators ─────────────────────────────────────
+
   async function pushAction(type, summary, meta = {}) {
-    const cleanSummary = short(summary, 120)
-    const a = await readJson(FILE_ACTIONS, { items: [] })
-    a.items.push({ type, summary: cleanSummary, meta, at: new Date().toISOString() })
-    a.items = cap(a.items, MAX_ACTIONS)
-    await writeJson(FILE_ACTIONS, a)
+    const cleanSummary = short(summary, 150)
+    actions.items.push({
+      type,
+      summary: cleanSummary,
+      meta: { ...meta, at: new Date().toISOString() },
+    })
+    actions.items = cap(actions.items, LIMITS.actions)
 
-    // Auto-learn patterns
+    // Learn from real errors only
     if (type === "error") {
-      const p = await readJson(FILE_PATTERNS, { recurring: [], errors: [], decisions: [] })
-      const errKey = cleanSummary.slice(0, 40)
-      p.errors.push(errKey)
-      p.errors = cap(p.errors, 10)
-      // Detect recurring errors
-      const count = p.errors.filter((e) => e === errKey).length
-      if (count >= 3 && !p.recurring.includes(errKey)) {
-        p.recurring.push(errKey)
-        p.recurring = cap(p.recurring, 10)
+      const errKey = cleanSummary.slice(0, 50)
+      patterns.errors.push(errKey)
+      patterns.errors = cap(patterns.errors, LIMITS.errors)
+      // Escalate to recurring if seen 3+ times
+      const count = patterns.errors.filter((e) => e === errKey).length
+      if (count >= 3 && !patterns.recurring.includes(errKey)) {
+        patterns.recurring.push(errKey)
+        patterns.recurring = cap(patterns.recurring, LIMITS.recurring)
       }
-      await writeJson(FILE_PATTERNS, p)
     }
+    dirty = true
   }
 
   async function pushDialog(text, role = "user") {
-    const cleanText = short(text, 500)
-    const d = await readJson(FILE_DIALOG, { entries: [] })
-    d.entries.push({ text: cleanText, role, at: new Date().toISOString() })
-    d.entries = cap(d.entries, MAX_DIALOG_ENTRIES)
-    await writeJson(FILE_DIALOG, d)
+    const cleanText = short(text, 600)
+    dialog.entries.push({ text: cleanText, role, at: new Date().toISOString() })
+    dialog.entries = cap(dialog.entries, LIMITS.dialog)
 
-    // Auto-detect decisions
-    const decisions = extractDecisions(cleanText)
-    if (decisions.length) {
-      const p = await readJson(FILE_PATTERNS, { recurring: [], errors: [], decisions: [] })
-      for (const dec of decisions) {
-        if (!p.decisions.includes(dec)) {
-          p.decisions.push(dec)
-        }
+    // Extract decisions
+    const decisions = extractPatterns(cleanText, RE_DECISIONS)
+    for (const d of decisions) {
+      if (!patterns.decisions.includes(d)) {
+        patterns.decisions.push(d)
       }
-      p.decisions = cap(p.decisions, 10)
-      await writeJson(FILE_PATTERNS, p)
     }
+    patterns.decisions = cap(patterns.decisions, LIMITS.decisions)
+
+    // Extract knowledge
+    const facts = extractKnowledge(cleanText, pendingToolOutputs)
+    for (const f of facts) {
+      const entry = { text: f, at: new Date().toISOString(), source: role }
+      // Dedup: skip if very similar fact exists
+      if (!knowledge.facts.some((k) => k.text === f)) {
+        knowledge.facts.push(entry)
+      }
+    }
+    knowledge.facts = cap(knowledge.facts, LIMITS.knowledge)
+
+    // Extract file paths mentioned
+    const files = extractFilePaths(cleanText)
+
+    dirty = true
+    return { decisions, facts, files }
   }
 
-  async function updateCurrentContext() {
-    const a = await readJson(FILE_ACTIONS, { items: [] })
-    const d = await readJson(FILE_DIALOG, { entries: [] })
-    const { summary, nextSteps } = autoSummarize(a.items, d.entries)
-    const c = await readJson(FILE_CURRENT, { summary: "", nextSteps: [] })
-    c.summary = summary
-    c.nextSteps = nextSteps
-    c.updatedAt = new Date().toISOString()
-    await writeJson(FILE_CURRENT, c)
+  async function flush() {
+    if (!dirty) return
+    context = autoSummarize(actions.items, dialog.entries, patterns)
+    context.updatedAt = new Date().toISOString()
+
+    await Promise.all([
+      atomicWrite(FILES.actions, actions),
+      atomicWrite(FILES.dialog, dialog),
+      atomicWrite(FILES.context, context),
+      atomicWrite(FILES.patterns, patterns),
+      atomicWrite(FILES.knowledge, knowledge),
+      atomicWrite(FILES.sessions, sessions),
+    ])
+    dirty = false
   }
+
+  // ─── Hook handlers ─────────────────────────────────────────
 
   return {
     /**
-     * AUTONOMOUS: Inject memory digest into every system prompt.
+     * Inject full memory digest into every system prompt.
      */
     async "experimental.chat.system.transform"(input, output) {
-      const sessionID = input.sessionID || "unknown"
-      const digest = buildMemoryDigest({ identity, sessions, actions, dialog, current, patterns })
+      const digest = buildDigest({ identity, sessions, actions, dialog, context, patterns, knowledge })
       output.system.push(`\n---\n${digest}\n---\n`)
     },
 
     /**
-     * AUTONOMOUS: On every user message, log it and update context.
+     * Capture every user message.
      */
     async "chat.message"(input, output) {
-      const sessionID = input.sessionID
       const text = output.parts
         ?.filter((p) => p.type === "text")
         .map((p) => p.text)
         .join(" ")
       if (text?.trim()) {
         await pushDialog(text.trim(), "user")
-        await updateCurrentContext()
+        // Flush after user message (highest-value capture point)
+        await flush()
       }
     },
 
     /**
-     * AUTONOMOUS: After every tool execution, log the action.
+     * Log every tool execution with accurate error classification.
      */
     async "tool.execute.after"(input, output) {
-      const sessionID = input.sessionID
       const tool = input.tool
-      const callID = input.callID
       const result = output.output || ""
-      const isError = /error|failed|exception/i.test(String(result))
-      const type = isError ? "error" : "action"
-      const summary = `${tool}: ${short(result, 100)}`
-      await pushAction(type, summary, { sessionID, tool, callID })
-      await updateCurrentContext()
+      const isErr = isGenuineError(tool, result)
+      const type = isErr ? "error" : "action"
+      const summary = `${tool}: ${short(result, 120)}`
+      await pushAction(type, summary, {
+        sessionID: input.sessionID,
+        tool,
+        callID: input.callID,
+      })
+      // Stash output for knowledge extraction on next user message
+      pendingToolOutputs.push(result)
+      if (pendingToolOutputs.length > 5) pendingToolOutputs = pendingToolOutputs.slice(-5)
+      await flush()
     },
 
     /**
-     * AUTONOMOUS: On session compaction, force a handoff summary.
+     * Protect context during compaction — inject preservation instructions.
      */
     async "experimental.session.compacting"(input, output) {
-      const sessionID = input.sessionID
       output.context.push(
-        `[AUTONOMOUS PERSISTENCE] Session ${sessionID} is being compacted. ` +
-        `Preserve key decisions, open questions, errors encountered, and explicit next steps ` +
-        `in the compaction summary so the next context window can continue seamlessly.`,
+        "[AUTONOMOUS PERSISTENCE v2] Session is being compacted. " +
+        "You MUST preserve in the compaction summary: " +
+        "(1) all key decisions and their rationale, " +
+        "(2) unresolved errors and their root causes, " +
+        "(3) explicit next steps and pending tasks, " +
+        "(4) important file paths and configurations discovered, " +
+        "(5) user preferences and conventions stated. " +
+        "The next context window depends on this summary."
       )
-      await updateCurrentContext()
+      await flush()
     },
 
     /**
-     * AUTONOMOUS: Track session lifecycle.
+     * Track session lifecycle.
      */
     async event({ event }) {
+      const sessionID = event.properties?.sessionID
+      if (!sessionID) return
+
       if (event.type === "session.created") {
-        const sessionID = event.properties?.sessionID
-        if (sessionID) {
-          const s = await readJson(FILE_SESSIONS, { history: [] })
-          s.history.push({ id: sessionID, startedAt: new Date().toISOString(), status: "active" })
-          s.history = cap(s.history, MAX_SESSIONS)
-          await writeJson(FILE_SESSIONS, s)
-        }
+        sessions.history.push({
+          id: sessionID,
+          startedAt: new Date().toISOString(),
+          status: "active",
+        })
+        sessions.history = cap(sessions.history, LIMITS.sessions)
+        dirty = true
+        await flush()
       }
 
       if (event.type === "session.deleted" || event.type === "session.compacted") {
-        const sessionID = event.properties?.sessionID
-        if (sessionID) {
-          const s = await readJson(FILE_SESSIONS, { history: [] })
-          const idx = s.history.findIndex((x) => x.id === sessionID)
-          if (idx >= 0) {
-            s.history[idx].status = event.type === "session.deleted" ? "deleted" : "compacted"
-            s.history[idx].endedAt = new Date().toISOString()
-            await writeJson(FILE_SESSIONS, s)
-          }
-          // Final context update before potential loss
-          await updateCurrentContext()
+        const idx = sessions.history.findIndex((s) => s.id === sessionID)
+        if (idx >= 0) {
+          sessions.history[idx].status = event.type === "session.deleted" ? "deleted" : "compacted"
+          sessions.history[idx].endedAt = new Date().toISOString()
         }
+        await flush()
       }
     },
 
     /**
-     * AUTONOMOUS: On dispose, ensure final state is saved.
+     * Final state persist on shutdown.
      */
     async dispose() {
-      await updateCurrentContext()
+      await flush()
     },
   }
 }
