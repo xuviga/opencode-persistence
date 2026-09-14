@@ -1,8 +1,8 @@
 /**
- * opencode-persistence v4.1 — SQLite-backed Autonomous Memory (Bun native)
+ * opencode-persistence v4.2 — SQLite-backed Autonomous Memory (Bun native)
  *
- * Single file. SQLite DB via bun:sqlite. No native modules. No race conditions.
- * Auto-flush 30s. Full capture. Queryable via memory_* tools.
+ * Single file. SQLite DB via bun:sqlite. FTS5 full-text search. No native modules.
+ * Auto-flush 30s. Crash-safe flush. Smart digest. Full self-awareness.
  */
 
 import { Database } from "bun:sqlite"
@@ -12,9 +12,22 @@ import os from "os"
 
 const MEMORY_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), ".config"), "opencode", "memory")
 const DB_PATH = path.join(MEMORY_DIR, "memory.db")
+const LEGACY_DB = path.join(MEMORY_DIR, "memory.db")
 
 let db = null
 let autoSaveTimer = null
+
+// ─── FTS5 helper ────────────────────────────────────────────────
+
+function fts5Available(db) {
+  try {
+    db.exec("CREATE VIRTUAL TABLE IF NOT EXISTS _fts_test USING fts5(x)")
+    db.exec("DROP TABLE IF EXISTS _fts_test")
+    return true
+  } catch { return false }
+}
+
+// ─── Storage init ───────────────────────────────────────────────
 
 async function ensureStorage() {
   await mkdir(MEMORY_DIR, { recursive: true })
@@ -22,9 +35,11 @@ async function ensureStorage() {
   db.exec("PRAGMA journal_mode = WAL")
   db.exec("PRAGMA foreign_keys = ON")
 
+  const hasFTS5 = fts5Available(db)
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id=1), name TEXT NOT NULL, role TEXT NOT NULL, notes TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
-    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT DEFAULT 'active', agent TEXT, model_provider TEXT, model_id TEXT, project_dir TEXT);
+    CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT DEFAULT 'active', agent TEXT, model_provider TEXT, model_id TEXT, project_dir TEXT, tool_count INTEGER DEFAULT 0, action_count INTEGER DEFAULT 0, dialog_count INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0);
     CREATE TABLE IF NOT EXISTS actions (id INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL, summary TEXT NOT NULL, session_id TEXT, tool TEXT, call_id TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS dialog (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, role TEXT DEFAULT 'user', session_id TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS assistant_replies (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL, tool_calls TEXT, session_id TEXT, message_id TEXT, model TEXT, agent TEXT, created_at TEXT DEFAULT (datetime('now')));
@@ -36,23 +51,66 @@ async function ensureStorage() {
     CREATE TABLE IF NOT EXISTS session_errors (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, error_type TEXT NOT NULL, message TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, snapshot TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS patches (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, hash TEXT NOT NULL, files TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS config_history (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, key TEXT NOT NULL, value TEXT, changed_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS archive (id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_data TEXT NOT NULL, archived_at TEXT DEFAULT (datetime('now')), original_created_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_actions_type ON actions(type);
     CREATE INDEX IF NOT EXISTS idx_actions_created ON actions(created_at);
+    CREATE INDEX IF NOT EXISTS idx_actions_session ON actions(session_id);
     CREATE INDEX IF NOT EXISTS idx_dialog_created ON dialog(created_at);
+    CREATE INDEX IF NOT EXISTS idx_dialog_session ON dialog(session_id);
     CREATE INDEX IF NOT EXISTS idx_replies_created ON assistant_replies(created_at);
+    CREATE INDEX IF NOT EXISTS idx_replies_session ON assistant_replies(session_id);
     CREATE INDEX IF NOT EXISTS idx_file_changes_file ON file_changes(file);
     CREATE INDEX IF NOT EXISTS idx_file_changes_created ON file_changes(created_at);
     CREATE INDEX IF NOT EXISTS idx_errors_created ON session_errors(created_at);
     CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);
+    CREATE INDEX IF NOT EXISTS idx_config_session ON config_history(session_id);
+    CREATE INDEX IF NOT EXISTS idx_archive_table ON archive(table_name);
   `)
 
+  // FTS5 virtual tables (if available)
+  if (hasFTS5) {
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_actions USING fts5(summary, content='actions', content_rowid='id', tokenize='porter unicode61');
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_dialog USING fts5(text, content='dialog', content_rowid='id', tokenize='porter unicode61');
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_replies USING fts5(text, content='assistant_replies', content_rowid='id', tokenize='porter unicode61');
+      CREATE VIRTUAL TABLE IF NOT EXISTS fts_knowledge USING fts5(fact, content='knowledge', content_rowid='id', tokenize='porter unicode61');
+    `)
+    // Triggers to keep FTS5 in sync
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS trg_fts_actions_i AFTER INSERT ON actions BEGIN INSERT INTO fts_actions(rowid, summary) VALUES (new.id, new.summary); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_actions_d AFTER DELETE ON actions BEGIN INSERT INTO fts_actions(fts_actions, rowid, summary) VALUES('delete', old.id, old.summary); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_dialog_i AFTER INSERT ON dialog BEGIN INSERT INTO fts_dialog(rowid, text) VALUES (new.id, new.text); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_dialog_d AFTER DELETE ON dialog BEGIN INSERT INTO fts_dialog(fts_dialog, rowid, text) VALUES('delete', old.id, old.text); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_replies_i AFTER INSERT ON assistant_replies BEGIN INSERT INTO fts_replies(rowid, text) VALUES (new.id, new.text); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_replies_d AFTER DELETE ON assistant_replies BEGIN INSERT INTO fts_replies(fts_replies, rowid, text) VALUES('delete', old.id, old.text); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_knowledge_i AFTER INSERT ON knowledge BEGIN INSERT INTO fts_knowledge(rowid, fact) VALUES (new.id, new.fact); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_knowledge_d AFTER DELETE ON knowledge BEGIN INSERT INTO fts_knowledge(fts_knowledge, rowid, fact) VALUES('delete', old.id, old.fact); END;
+    `)
+  }
+
   db.prepare("INSERT OR IGNORE INTO identity (id, name, role, notes) VALUES (1, 'XuViGaN', 'autonomous_agent', ?)")
-    .run("Persistence v4.1 SQLite (bun:sqlite). Full self-awareness. Query via memory_* tools.")
+    .run("Persistence v4.2 SQLite (bun:sqlite). FTS5: " + (hasFTS5 ? "enabled" : "unavailable") + ". Query via memory_* tools.")
   db.prepare("INSERT OR IGNORE INTO context (id, summary, next_steps) VALUES (1, '', '')").run()
 
   autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 30_000)
   if (autoSaveTimer.unref) autoSaveTimer.unref()
+
+  // Crash-safe flush
+  const cleanup = async () => {
+    if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
+    try { await flush() } catch {}
+    try { db?.close() } catch {}
+    process.exit(0)
+  }
+  process.on("SIGINT", cleanup)
+  process.on("SIGTERM", cleanup)
+  process.on("exit", () => { try { db?.close() } catch {} })
+
+  return hasFTS5
 }
+
+// ─── Mutex ──────────────────────────────────────────────────────
 
 let mutexQueue = Promise.resolve()
 function mutex(fn) {
@@ -60,6 +118,8 @@ function mutex(fn) {
   mutexQueue = r.catch(() => {})
   return r
 }
+
+// ─── Prepared Statements ───────────────────────────────────────
 
 let stmts = {}
 function prepareStatements() {
@@ -76,6 +136,9 @@ function prepareStatements() {
   stmts.uPattern = db.prepare("INSERT INTO patterns (category, value, count) VALUES (?, ?, 1) ON CONFLICT(category, value) DO UPDATE SET count = count + 1, last_seen = datetime('now')")
   stmts.upsertKnowledge = db.prepare("INSERT OR IGNORE INTO knowledge (fact, source, session_id) VALUES (?, ?, ?)")
   stmts.uContext = db.prepare("UPDATE context SET summary = ?, next_steps = ?, updated_at = datetime('now') WHERE id = 1")
+  stmts.uSessionMetrics = db.prepare("UPDATE sessions SET tool_count = tool_count + ?, action_count = action_count + ?, dialog_count = dialog_count + ?, error_count = error_count + ? WHERE id = ?")
+  stmts.iConfigHistory = db.prepare("INSERT INTO config_history (session_id, key, value) VALUES (?, ?, ?)")
+  stmts.iArchive = db.prepare("INSERT INTO archive (table_name, row_data, original_created_at) VALUES (?, ?, ?)")
   stmts.gContext = db.prepare("SELECT * FROM context WHERE id = 1")
   stmts.gIdentity = db.prepare("SELECT * FROM identity WHERE id = 1")
   stmts.gSessions = db.prepare("SELECT * FROM sessions ORDER BY started_at DESC LIMIT ?")
@@ -101,7 +164,16 @@ function prepareStatements() {
   stmts.gActionsRange = db.prepare("SELECT * FROM actions WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
   stmts.gErrorsRange = db.prepare("SELECT * FROM session_errors WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
   stmts.gFilesRange = db.prepare("SELECT * FROM file_changes WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
-  stmts.gStats = db.prepare("SELECT (SELECT COUNT(*) FROM actions) as a, (SELECT COUNT(*) FROM dialog) as d, (SELECT COUNT(*) FROM assistant_replies) as r, (SELECT COUNT(*) FROM sessions) as s, (SELECT COUNT(*) FROM file_changes) as f, (SELECT COUNT(*) FROM knowledge) as k, (SELECT COUNT(*) FROM patterns) as p, (SELECT COUNT(*) FROM session_errors) as se, (SELECT COUNT(*) FROM todos) as t")
+  stmts.gConfigHistory = db.prepare("SELECT * FROM config_history WHERE session_id = ? ORDER BY changed_at DESC LIMIT ?")
+  stmts.gSessionMetrics = db.prepare("SELECT * FROM sessions WHERE id = ? OR id LIKE ? LIMIT 1")
+  stmts.gStats = db.prepare("SELECT (SELECT COUNT(*) FROM actions) as a, (SELECT COUNT(*) FROM dialog) as d, (SELECT COUNT(*) FROM assistant_replies) as r, (SELECT COUNT(*) FROM sessions) as s, (SELECT COUNT(*) FROM file_changes) as f, (SELECT COUNT(*) FROM knowledge) as k, (SELECT COUNT(*) FROM patterns) as p, (SELECT COUNT(*) FROM session_errors) as se, (SELECT COUNT(*) FROM todos) as t, (SELECT COUNT(*) FROM config_history) as ch, (SELECT COUNT(*) FROM archive) as ar")
+  stmts.gOldActions = db.prepare("SELECT * FROM actions WHERE created_at < ? ORDER BY created_at ASC LIMIT ?")
+  stmts.gOldDialog = db.prepare("SELECT * FROM dialog WHERE created_at < ? ORDER BY created_at ASC LIMIT ?")
+  stmts.gOldReplies = db.prepare("SELECT * FROM assistant_replies WHERE created_at < ? ORDER BY created_at ASC LIMIT ?")
+  stmts.dOldActions = db.prepare("DELETE FROM actions WHERE created_at < ? AND id <= ?")
+  stmts.dOldDialog = db.prepare("DELETE FROM dialog WHERE created_at < ? AND id <= ?")
+  stmts.dOldReplies = db.prepare("DELETE FROM assistant_replies WHERE created_at < ? AND id <= ?")
+  stmts.cSession = db.prepare("SELECT COUNT(*) as cnt FROM sessions WHERE id = ?")
 }
 
 // ─── Text utils ─────────────────────────────────────────────────
@@ -156,6 +228,7 @@ function extractPatterns(text, patterns) {
 
 function textFromParts(parts) { return parts ? parts.filter((p) => p.type === "text").map((p) => p.text).join(" ").trim() : "" }
 function fmt(iso) { return iso ? iso.replace("T", " ").slice(0, 19) : "?" }
+function epochMs(iso) { return iso ? new Date(iso).getTime() : 0 }
 
 // ─── Digest ─────────────────────────────────────────────────────
 
@@ -165,22 +238,22 @@ async function buildDigest() {
     , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
     , kn = stmts.gKnowledge.all(10), rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
 
-  lines.push("[AUTONOMOUS PERSISTENCE v4.1] Active. Full self-awareness enabled.")
+  lines.push("[AUTONOMOUS PERSISTENCE v4.2] Active. Full self-awareness enabled.")
   lines.push("Use memory_* tools to query this store. All data auto-captured below.")
   lines.push(`Identity: ${id.name} (${id.role})`)
   if (id.notes) lines.push(`Identity notes: ${id.notes}`)
   if (ctx?.summary) lines.push(`Previous session handoff: ${ctx.summary}`)
   if (ctx?.next_steps) { try { const s = JSON.parse(ctx.next_steps); if (s.length) { lines.push("Pending next steps:"); for (const x of s) lines.push(`  - ${x}`) } } catch {} }
-  lines.push(`Memory: ${st.s} sessions, ${st.a} actions, ${st.d} dialog, ${st.r} replies, ${st.f} files, ${st.se} errors`)
-  if (rs.length) { lines.push("Recent sessions:"); for (const s of rs) { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; lines.push(`  ${s.id.slice(-8)}(${s.status})${m} ${fmt(s.started_at)}`) } }
-  if (re.length) { lines.push("Recent session errors:"); for (const e of re) lines.push(`  [${e.error_type}] ${short(e.message, 100)} (${fmt(e.created_at)})`) }
+  lines.push(`Memory: ${st.s} sessions, ${st.a} actions, ${st.d} dialog, ${st.r} replies, ${st.f} files, ${st.se} errors, ${st.ch} config changes, ${st.ar} archived`)
+  if (rs.length) { lines.push("Recent sessions:"); for (const s of rs) { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; const dur = s.ended_at ? `${Math.round((epochMs(s.ended_at) - epochMs(s.started_at)) / 60000)}min` : "running"; lines.push(`  ${s.id.slice(-8)}(${s.status})${m} ${fmt(s.started_at)} → ${dur}, tools:${s.tool_count || 0} acts:${s.action_count || 0} errs:${s.error_count || 0}`) } }
+  if (re.length) { lines.push("Recent session errors:"); for (const e of re.slice(0, 3)) lines.push(`  [${e.error_type}] ${short(e.message, 100)} (${fmt(e.created_at)})`) }
   if (ra.length) { lines.push("Latest actions:"); for (const a of ra.slice(0, 5)) lines.push(`  [${a.type}] ${short(a.summary, 100)}`) }
-  if (rr.length) { lines.push("My latest replies:"); for (const r of rr) lines.push(`  ${short(r.text, 80)}`) }
-  if (rd.length) { lines.push("Recent user requests:"); for (const d of rd) lines.push(`  - ${short(d.text, 120)}`) }
+  if (rr.length) { lines.push("My latest replies:"); for (const r of rr.slice(0, 2)) lines.push(`  ${short(r.text, 80)}`) }
+  if (rd.length) { lines.push("Recent user requests:"); for (const d of rd.slice(0, 3)) lines.push(`  - ${short(d.text, 120)}`) }
   if (rf.length) lines.push(`Recently edited files: ${rf.map((f) => `${f.file}(${f.edits}x)`).join(", ")}`)
   if (lt?.todos_json) { try { const tl = JSON.parse(lt.todos_json); const ac = tl.filter((t) => t.status !== "completed"); if (ac.length) { lines.push(`Active todos (${ac.length}):`); for (const t of ac.slice(0, 5)) lines.push(`  [${t.status}] ${short(t.content, 80)}`) } } catch {} }
   if (dec.length) lines.push(`Key decisions: ${dec.map((d) => d.value).join("; ")}`)
-  if (kn.length) { lines.push("Accumulated knowledge:"); for (const k of kn) lines.push(`  - ${short(k.fact, 140)}`) }
+  if (kn.length) { lines.push("Accumulated knowledge:"); for (const k of kn.slice(0, 5)) lines.push(`  - ${short(k.fact, 140)}`) }
   return lines.join("\n")
 }
 
@@ -203,26 +276,102 @@ async function flush() {
   })
 }
 
+// ─── Smart digest rotation ─────────────────────────────────────
+
+let lastRotation = 0
+const ROTATION_INTERVAL = 24 * 60 * 60 * 1000 // 24 hours
+
+async function rotateOldData() {
+  const now = Date.now()
+  if (now - lastRotation < ROTATION_INTERVAL) return
+  lastRotation = now
+
+  await mutex(async () => {
+    const cutoff = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString() // 7 days ago
+    // Archive old actions
+    const oldActions = stmts.gOldActions.all(cutoff, 100)
+    for (const a of oldActions) {
+      stmts.iArchive.run("actions", JSON.stringify(a), a.created_at)
+    }
+    if (oldActions.length) stmts.dOldActions.run(cutoff, oldActions[oldActions.length - 1].id)
+    // Archive old dialog
+    const oldDialog = stmts.gOldDialog.all(cutoff, 100)
+    for (const d of oldDialog) {
+      stmts.iArchive.run("dialog", JSON.stringify(d), d.created_at)
+    }
+    if (oldDialog.length) stmts.dOldDialog.run(cutoff, oldDialog[oldDialog.length - 1].id)
+    // Archive old replies
+    const oldReplies = stmts.gOldReplies.all(cutoff, 50)
+    for (const r of oldReplies) {
+      stmts.iArchive.run("assistant_replies", JSON.stringify(r), r.created_at)
+    }
+    if (oldReplies.length) stmts.dOldReplies.run(cutoff, oldReplies[oldReplies.length - 1].id)
+  })
+}
+
 // ─── Record functions ──────────────────────────────────────────
 
-async function rAction(type, summary, sessionID, tool, callID) { await mutex(() => { stmts.iAction.run(short(summary, 150), short(summary, 150), sessionID, tool, callID) }) }
-async function rDialog(text, role, sessionID) { await mutex(() => { stmts.iDialog.run(short(text, 600), role, sessionID) }) }
+async function rAction(type, summary, sessionID, tool, callID) {
+  await mutex(() => {
+    stmts.iAction.run(short(summary, 150), short(summary, 150), sessionID, tool, callID)
+    stmts.uSessionMetrics.run(tool ? 1 : 0, 1, 0, type === "error" ? 1 : 0, sessionID)
+  })
+}
+async function rDialog(text, role, sessionID) {
+  await mutex(() => {
+    stmts.iDialog.run(short(text, 600), role, sessionID)
+    stmts.uSessionMetrics.run(0, 0, 1, 0, sessionID)
+  })
+}
 async function rReply(text, toolCalls, sessionID, messageID, model, agent) { await mutex(() => { stmts.iReply.run(short(text, 800), JSON.stringify(toolCalls || []), sessionID, messageID, model, agent) }) }
 async function rFileChange(file, sessionID, changeType, add, del) { await mutex(() => { stmts.iFileChange.run(file, sessionID, changeType || "edit", add || 0, del || 0) }) }
 async function rTodos(sessionID, todoList) { await mutex(() => { stmts.iTodo.run(sessionID, JSON.stringify(todoList)) }) }
-async function rSessionError(sessionID, errorType, message) { await mutex(() => { stmts.iSessionError.run(sessionID, errorType, short(message, 300)); stmts.uPattern.run("error", errorType) }) }
+async function rSessionError(sessionID, errorType, message) {
+  await mutex(() => {
+    stmts.iSessionError.run(sessionID, errorType, short(message, 300))
+    stmts.uPattern.run("error", errorType)
+    stmts.uSessionMetrics.run(0, 0, 0, 1, sessionID)
+  })
+}
 async function rSnapshot(sessionID, messageID, snapshotData) { await mutex(() => { stmts.iSnapshot.run(sessionID, messageID, short(snapshotData, 500)) }) }
 async function rPatch(sessionID, messageID, hash, files) { await mutex(() => { stmts.iPatch.run(sessionID, messageID, hash, JSON.stringify(files)) }) }
-async function rSession(sessionID, agent, model, projectDir) { await mutex(() => { stmts.iSession.run(sessionID, new Date().toISOString(), agent || null, model?.providerID || null, model?.modelID || null, projectDir || null) }) }
+
+async function rSession(sessionID, agent, model, projectDir) {
+  await mutex(() => {
+    if (!stmts.cSession.get(sessionID).cnt) {
+      stmts.iSession.run(sessionID, new Date().toISOString(), agent || null, model?.providerID || null, model?.modelID || null, projectDir || null)
+    }
+  })
+}
 async function rCloseSession(sessionID, status) { await mutex(() => { stmts.uCloseSession.run(status, sessionID) }) }
 async function rDecision(text) { await mutex(() => { for (const d of extractPatterns(text, RE_DECISIONS)) stmts.uPattern.run("decision", d) }) }
 async function rKnowledge(text, sessionID) { await mutex(() => { for (const f of extractPatterns(text, RE_FACTS)) stmts.upsertKnowledge.run(f, sessionID || null) }) }
+async function rConfigChange(sessionID, key, value) { await mutex(() => { stmts.iConfigHistory.run(sessionID, key, short(String(value), 200)) }) }
+
+// ─── FTS5 search ───────────────────────────────────────────────
+
+function ftsSearch(query, max) {
+  try {
+    const ftsQuery = query.replace(/['"]/g, "").split(/\s+/).filter(w => w.length > 2).join(" OR ")
+    if (!ftsQuery) return null
+    const rows = db.prepare(`
+      SELECT 'action' as src, a.id, a.summary as text, a.created_at FROM fts_actions fa JOIN actions a ON a.id = fa.rowid WHERE fts_actions MATCH ? LIMIT ?
+      UNION ALL
+      SELECT 'dialog' as src, d.id, d.text, d.created_at FROM fts_dialog fd JOIN dialog d ON d.id = fd.rowid WHERE fts_dialog MATCH ? LIMIT ?
+      UNION ALL
+      SELECT 'reply' as src, r.id, r.text, r.created_at FROM fts_replies fr JOIN assistant_replies r ON r.id = fr.rowid WHERE fts_replies MATCH ? LIMIT ?
+      UNION ALL
+      SELECT 'knowledge' as src, k.id, k.fact as text, k.created_at FROM fts_knowledge fk JOIN knowledge k ON k.id = fk.rowid WHERE fts_knowledge MATCH ? LIMIT ?
+    `).all(ftsQuery, max, ftsQuery, max, ftsQuery, max, ftsQuery, max)
+    return rows
+  } catch { return null }
+}
 
 // ─── Plugin ────────────────────────────────────────────────────
 
 export async function PersistencePlugin(input, options = {}) {
   const { client, project, directory, worktree, serverUrl } = input
-  await ensureStorage()
+  const hasFTS5 = await ensureStorage()
   prepareStatements()
 
   const projectDir = directory || worktree || process.cwd()
@@ -231,10 +380,32 @@ export async function PersistencePlugin(input, options = {}) {
 
   const tools = {
     memory_search: {
-      description: "Search persistent memory across actions, dialog, replies, knowledge, files, errors. Supports time-range.",
-      args: { type: "object", properties: { query: { type: "string", description: "Text to search" }, max: { type: "number", description: "Max per category (default 10)" }, since: { type: "string", description: "ISO date after" }, until: { type: "string", description: "ISO date before" } }, required: ["query"] },
+      description: "Search persistent memory across actions, dialog, replies, knowledge, files, errors. Supports time-range and FTS5 full-text search.",
+      args: { type: "object", properties: { query: { type: "string", description: "Text to search" }, max: { type: "number", description: "Max per category (default 10)" }, since: { type: "string", description: "ISO date after" }, until: { type: "string", description: "ISO date before" }, fts: { type: "boolean", description: "Use FTS5 full-text search (default true if available)" } } },
+      required: ["query"]
+    },
       async execute(args) {
         const q = `%${args.query}%`, max = args.max || 10, r = []
+        const useFTS = hasFTS5 && args.fts !== false
+
+        // FTS5 full-text search
+        if (useFTS && !args.since) {
+          const ftsResults = ftsSearch(args.query, max)
+          if (ftsResults?.length) {
+            const groups = {}
+            for (const row of ftsResults) {
+              if (!groups[row.src]) groups[row.src] = []
+              groups[row.src].push(row)
+            }
+            for (const [src, rows] of Object.entries(groups)) {
+              r.push(`## ${src.charAt(0).toUpperCase() + src.slice(1)} (FTS)`)
+              rows.forEach(row => r.push(`  [${row.src}] ${short(row.text, 120)} (${fmt(row.created_at)})`))
+            }
+            return r.join("\n")
+          }
+        }
+
+        // Fallback: LIKE search
         let acts = []
         if (args.since) acts = stmts.gActionsRange.all(args.since, args.until || new Date().toISOString(), max)
         else acts = stmts.sActions.all(q, q, max)
@@ -250,7 +421,7 @@ export async function PersistencePlugin(input, options = {}) {
         if (args.since) errs = stmts.gErrorsRange.all(args.since, args.until || new Date().toISOString(), max)
         else errs = stmts.sErrors.all(q, max)
         if (errs.length) { r.push("## Errors"); errs.forEach(e => r.push(`  [${e.error_type}] ${short(e.message, 100)} (${fmt(e.created_at)})`)) }
-        return r.length ? r.join("\n") : "No matches found."
+        return r.length ? r.join("\n") : (useFTS ? "No FTS5 matches and no LIKE matches found." : "No matches found.")
       }
     },
     memory_decisions: {
@@ -286,17 +457,65 @@ export async function PersistencePlugin(input, options = {}) {
       }
     },
     memory_sessions: {
-      description: "Session history, cross-session chains by project, per-session details",
+      description: "Session history, cross-session chains by project, per-session details with metrics",
       args: { type: "object", properties: { sessionID: { type: "string", description: "Session ID or last 6 chars" } } },
       async execute(args) {
         if (args.sessionID) {
           const all = stmts.gSessions.all(100), f = all.find(s => s.id === args.sessionID || s.id.endsWith(args.sessionID))
           if (!f) return `Not found. ${all.length} known.`
-          return JSON.stringify({ session: f, model: f.model_id ? `${f.model_provider}/${f.model_id}` : null, agent: f.agent }, null, 2)
+          const cfg = stmts.gConfigHistory.all(f.id, 10)
+          const dur = f.ended_at ? Math.round((epochMs(f.ended_at) - epochMs(f.started_at)) / 60000) + " min" : "running"
+          return JSON.stringify({
+            session: f,
+            duration: dur,
+            metrics: { tools: f.tool_count, actions: f.action_count, dialog: f.dialog_count, errors: f.error_count },
+            model: f.model_id ? `${f.model_provider}/${f.model_id}` : null,
+            agent: f.agent,
+            config_changes: cfg
+          }, null, 2)
         }
         const act = stmts.gSessions.all(30).filter(s => s.status === "active"), chain = stmts.gSessionChain.all(projectDir, 10)
         const l = [`Total: ${act.length} active sessions`, `Project: ${projectDir}`]
-        if (chain.length) { l.push("## Chain:"); chain.forEach(s => { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; l.push(`  ${s.id.slice(-8)} ${s.status}${m}`) }) }
+        if (chain.length) { l.push("## Chain:"); chain.forEach(s => { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; const d = s.ended_at ? Math.round((epochMs(s.ended_at) - epochMs(s.started_at)) / 60000) + "min" : "running"; l.push(`  ${s.id.slice(-8)} ${s.status}${m} ${fmt(s.started_at)} ${d} tools:${s.tool_count || 0} errs:${s.error_count || 0}`) }) }
+        return l.join("\n")
+      }
+    },
+    memory_config: {
+      description: "Config change history per session. Track model/agent/options changes over time.",
+      args: { type: "object", properties: { sessionID: { type: "string", description: "Session ID or last 6 chars (optional, default: all recent)" } } },
+      async execute(args) {
+        let rows
+        if (args.sessionID) {
+          rows = stmts.gConfigHistory.all(args.sessionID, 50)
+        } else {
+          rows = db.prepare("SELECT * FROM config_history ORDER BY changed_at DESC LIMIT 50").all()
+        }
+        if (!rows.length) return "No config changes recorded."
+        const l = ["## Config changes"]
+        rows.forEach(r => l.push(`  ${r.session_id?.slice(-8) || "?"} | ${r.key} = ${short(r.value, 80)} (${fmt(r.changed_at)})`))
+        return l.join("\n")
+      }
+    },
+    memory_archive: {
+      description: "Browse archived data (pre-rotation). Query by table name or date range.",
+      args: { type: "object", properties: { table: { type: "string", description: "Table name filter (actions, dialog, assistant_replies)" }, since: { type: "string", description: "ISO date after" }, limit: { type: "number", description: "Max results (default 20)" } } },
+      async execute(args) {
+        const limit = args.limit || 20
+        let rows
+        if (args.table && args.since) {
+          rows = db.prepare("SELECT * FROM archive WHERE table_name = ? AND original_created_at > ? ORDER BY original_created_at DESC LIMIT ?").all(args.table, args.since, limit)
+        } else if (args.table) {
+          rows = db.prepare("SELECT * FROM archive WHERE table_name = ? ORDER BY original_created_at DESC LIMIT ?").all(args.table, limit)
+        } else if (args.since) {
+          rows = db.prepare("SELECT * FROM archive WHERE original_created_at > ? ORDER BY original_created_at DESC LIMIT ?").all(args.since, limit)
+        } else {
+          rows = db.prepare("SELECT * FROM archive ORDER BY original_created_at DESC LIMIT ?").all(limit)
+        }
+        if (!rows.length) return `No archived data. Rotation runs every 24h and archives data older than 7 days. Total archived: ${stmts.gStats.get().ar}.`
+        const l = [`## Archive (${rows.length} entries)`]
+        rows.forEach(r => {
+          try { const d = JSON.parse(r.row_data); l.push(`  [${r.table_name}] ${short(d.summary || d.text || d.fact || JSON.stringify(d).slice(0, 100), 100)} (archived: ${fmt(r.archived_at)})`) } catch { l.push(`  [${r.table_name}] ${short(r.row_data, 100)}`) }
+        })
         return l.join("\n")
       }
     },
@@ -306,12 +525,12 @@ export async function PersistencePlugin(input, options = {}) {
     tool: tools,
 
     "experimental.chat.system.transform" : async (input, output) => {
-      try { output.system.push(`\n---\n${await buildDigest()}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4.1] Error: ${e.message}\n---\n`) }
+      try { output.system.push(`\n---\n${await buildDigest()}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4.2] Error: ${e.message}\n---\n`) }
     },
 
     "chat.message": async (input, output) => {
       const text = textFromParts(output.parts)
-      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID); await flush() }
+      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID); await flush(); await rotateOldData() }
     },
 
     "tool.execute.after": async (input, output) => {
@@ -322,7 +541,7 @@ export async function PersistencePlugin(input, options = {}) {
     },
 
     "experimental.session.compacting": async (input, output) => {
-      output.context.push("[PERSISTENCE v4.1] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
+      output.context.push("[PERSISTENCE v4.2] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
       await flush()
     },
 
