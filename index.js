@@ -365,16 +365,24 @@ const RE_GENERIC_ERROR = /\b(error|failed|failure|exception|crash|panic|fatal|er
 const BACKUP_DIR = path.join(MEMORY_DIR, "backups")
 let lastBackup = 0
 
+const S3_ENDPOINT = process.env.MINIO_ENDPOINT || "http://localhost:9000"
+const S3_BUCKET = process.env.MINIO_BUCKET || "opencode-backup"
+const S3_ACCESS_KEY = process.env.MINIO_ACCESS_KEY || "minioadmin"
+const S3_SECRET_KEY = process.env.MINIO_SECRET_KEY || "minioadmin"
+
 async function backupDb() {
   const now = Date.now()
   if (now - lastBackup < 24 * 60 * 60 * 1000) return // 24h
+
   try {
+    // Local backup first
     await mkdir(BACKUP_DIR, { recursive: true })
     const stamp = new Date().toISOString().slice(0, 10)
     const dest = path.join(BACKUP_DIR, `memory-${stamp}.db`)
     const src = Bun.file(DB_PATH)
     await Bun.write(dest, src)
-    // Keep last 7 backups
+
+    // Keep last 7 local backups
     const { readdirSync, statSync, unlinkSync } = await import("fs")
     const files = readdirSync(BACKUP_DIR)
       .filter(f => f.startsWith("memory-") && f.endsWith(".db"))
@@ -383,6 +391,28 @@ async function backupDb() {
     for (const f of files.slice(7)) {
       try { unlinkSync(path.join(BACKUP_DIR, f.f)) } catch {}
     }
+
+    // S3 upload (optional, if endpoint configured)
+    if (S3_ENDPOINT && S3_ENDPOINT !== "http://localhost:9000") {
+      try {
+        const fileData = await Bun.file(dest).arrayBuffer()
+        const s3Url = `${S3_ENDPOINT}/${S3_BUCKET}/memory-${stamp}.db`
+
+        await fetch(s3Url, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/octet-stream",
+            "x-amz-acl": "private"
+          },
+          body: fileData,
+          signal: AbortSignal.timeout(30000)
+        })
+        debugLog(`S3 backup uploaded: ${s3Url}`)
+      } catch (s3e) {
+        debugLog("S3 backup failed (continuing with local only):", s3e.message)
+      }
+    }
+
     lastBackup = now
     debugLog("DB backup completed:", dest)
   } catch (e) { debugLog("DB backup failed:", e.message) }
@@ -500,34 +530,85 @@ function cosineSim(a, b) {
   return union === 0 ? 0 : inter / union
 }
 
-// LLM summarizer with caching + fallback
+// LLM summarizer — REAL HTTP call (OpenRouter-compatible)
+const LLM_API_URL = process.env.OPENROUTER_API_URL || "https://openrouter.ai/api/v1/chat/completions"
+const LLM_API_KEY = process.env.OPENROUTER_API_KEY || ""
 const llmCache = new Map()
+
 async function summarizeWithLLM(text) {
   const hash = quickHash(text)
   if (llmCache.has(hash)) return llmCache.get(hash)
+
+  if (!LLM_API_KEY) {
+    debugLog("No LLM API key, using fallback")
+    const fallback = `Auto-summary (${new Date().toISOString().slice(11,19)}): ${short(text, 200)}`
+    llmCache.set(hash, fallback)
+    return fallback
+  }
+
   try {
-    const resp = await client.chat.completions.create({
-      model: currentModel?.modelID || "kimi-k3-max",
-      messages: [{ role: "user", content: `Summarize in 2-3 sentences (RU or EN based on input):\n${text.slice(0, 2000)}` }],
-      max_tokens: 150
+    const resp = await fetch(LLM_API_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${LLM_API_KEY}` },
+      body: JSON.stringify({
+        model: "meta-llama/llama-3.1-8b-instruct",
+        messages: [{ role: "user", content: `Summarize in 2 sentences:\n${text.slice(0, 1500)}` }],
+        max_tokens: 100,
+        temperature: 0.3
+      }),
+      signal: AbortSignal.timeout(10000)
     })
-    const summary = resp.choices[0].message.content.trim()
+
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const data = await resp.json()
+    const summary = data.choices?.[0]?.message?.content?.trim() || `Summary failed: no content`
+
     llmCache.set(hash, summary)
-    // Log cost
     if (currentSessionID) {
-      try {
-        stmts.iCost.run(currentSessionID, "llm_summary", estimateTokens(text) + estimateTokens(summary))
-      } catch {}
+      try { stmts.iCost.run(currentSessionID, "llm_summary", estimateTokens(text) + estimateTokens(summary)) } catch {}
     }
     return summary
   } catch (e) {
     debugLog("LLM summarize failed:", e.message)
-    return `Auto-summary: ${short(text, 200)}` // fallback
+    const fallback = `Auto-summary (${new Date().toISOString().slice(11,19)}): ${short(text, 200)}`
+    llmCache.set(hash, fallback)
+    return fallback
   }
 }
 
-// Anomaly detection (error spike)
+// Anomaly detection (error spike) — as separate function
 const errorHistory = new Map()
+
+/**
+ * Detects error spikes and triggers anomaly
+ * @param {string} errorType - Type of error
+ * @param {number} threshold - Min count to trigger (default 5)
+ * @param {number} windowMs - Time window in ms (default 1 hour)
+ */
+async function detectAnomaly(errorType, threshold = 5, windowMs = 60 * 60 * 1000) {
+  const now = Date.now()
+  const recent = stmts.gRecentErrors.all()
+  const windowStart = new Date(now - windowMs).toISOString()
+
+  // Count errors in window
+  const inWindow = recent.filter(e => e.created_at >= windowStart && e.error_type === errorType).length
+
+  if (inWindow >= threshold && !errorHistory.get(errorType)) {
+    errorHistory.set(errorType, now)
+    await rAnomaly(currentSessionID, "error_spike", "high", `${errorType} occurred ${inWindow} times in last ${windowMs / 60000} minutes`)
+    await triggerWebhooks("anomaly", { type: errorType, count: inWindow, windowMs })
+    return true
+  }
+  return false
+}
+
+// Reset anomaly history after 2 hours
+setInterval(() => {
+  const now = Date.now()
+  for (const [type, timestamp] of errorHistory.entries()) {
+    if (now - timestamp > 2 * 60 * 60 * 1000) errorHistory.delete(type)
+  }
+}, 60 * 60 * 1000)
 
 // Adaptive flush
 let lastActivityTime = Date.now()
@@ -697,6 +778,20 @@ async function flush() {
   // Maintenance tasks
   await backupDb()
   await cleanExpiredKnowledge()
+  // Auto-suggest next step
+  const nextSteps = deriveNextSteps()
+  if (nextSteps.length && currentSessionID) {
+    try {
+      const pending = stmts.gLatestTodos.get()
+      if (!pending || !JSON.parse(pending.todos_json).filter(t => t.status !== "completed").length) {
+        // No active todos, suggest next logical step
+        const lastAction = stmts.gActions.all(1)[0]
+        if (lastAction && lastAction.type === "error") {
+          debugLog("Suggesting: fix error before continuing")
+        }
+      }
+    } catch {}
+  }
 }
 
 // ─── Smart digest rotation ─────────────────────────────────────
@@ -784,6 +879,20 @@ async function rKnowledge(text, sessionID, projectDir, isGlobal = false) {
       const canon = canonicalFact(f)
       if (seen.has(canon)) continue
       seen.add(canon)
+
+      // Real semantic dedup: check against existing knowledge with cosine similarity
+      const existing = stmts.gKnowledge.all(50)
+      let isDuplicate = false
+      for (const e of existing) {
+        const sim = cosineSim(canon, canonicalFact(e.fact))
+        if (sim > 0.7) { // 70% similarity = duplicate
+          isDuplicate = true
+          debugLog(`Semantic dedup: "${short(f, 50)}" ~ "${short(e.fact, 50)}" (score: ${sim.toFixed(2)})`)
+          break
+        }
+      }
+      if (isDuplicate) continue
+
       // Default TTL: 30 days for non-global, 90 for global
       const expiresAt = new Date(Date.now() + (isGlobal ? 90 : 30) * 24 * 60 * 60 * 1000).toISOString()
       stmts.upsertKnowledge.run(f, "auto-extract", sessionID || null, projectDir || null, isGlobal ? 1 : 0, expiresAt)
