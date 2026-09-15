@@ -12,7 +12,11 @@ import os from "os"
 
 const MEMORY_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), ".config"), "opencode", "memory")
 const DB_PATH = path.join(MEMORY_DIR, "memory.db")
-const LEGACY_DB = path.join(MEMORY_DIR, "memory.db")
+const DEBUG = process.env.OPENCODE_PERSISTENCE_DEBUG === "1"
+
+function debugLog(...args) {
+  if (DEBUG) console.log("[PERSISTENCE DEBUG]", ...args)
+}
 
 let db = null
 let autoSaveTimer = null
@@ -37,6 +41,16 @@ async function ensureStorage() {
 
   const hasFTS5 = fts5Available(db)
 
+  // Migration: ensure archive table exists
+  const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(t => t.name)
+  if (!tables.includes('archive')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS archive (id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_data TEXT NOT NULL, archived_at TEXT DEFAULT (datetime('now')), original_created_at TEXT);
+      CREATE INDEX IF NOT EXISTS idx_archive_table ON archive(table_name);
+    `)
+    debugLog("Migration: created archive table")
+  }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id=1), name TEXT NOT NULL, role TEXT NOT NULL, notes TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT DEFAULT 'active', agent TEXT, model_provider TEXT, model_id TEXT, project_dir TEXT, tool_count INTEGER DEFAULT 0, action_count INTEGER DEFAULT 0, dialog_count INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0);
@@ -52,7 +66,6 @@ async function ensureStorage() {
     CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, snapshot TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS patches (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, hash TEXT NOT NULL, files TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS config_history (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, key TEXT NOT NULL, value TEXT, changed_at TEXT DEFAULT (datetime('now')));
-    CREATE TABLE IF NOT EXISTS archive (id INTEGER PRIMARY KEY AUTOINCREMENT, table_name TEXT NOT NULL, row_data TEXT NOT NULL, archived_at TEXT DEFAULT (datetime('now')), original_created_at TEXT);
     CREATE INDEX IF NOT EXISTS idx_actions_type ON actions(type);
     CREATE INDEX IF NOT EXISTS idx_actions_created ON actions(created_at);
     CREATE INDEX IF NOT EXISTS idx_actions_session ON actions(session_id);
@@ -65,7 +78,6 @@ async function ensureStorage() {
     CREATE INDEX IF NOT EXISTS idx_errors_created ON session_errors(created_at);
     CREATE INDEX IF NOT EXISTS idx_todos_session ON todos(session_id);
     CREATE INDEX IF NOT EXISTS idx_config_session ON config_history(session_id);
-    CREATE INDEX IF NOT EXISTS idx_archive_table ON archive(table_name);
   `)
 
   // FTS5 virtual tables (if available)
@@ -80,12 +92,16 @@ async function ensureStorage() {
     db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_fts_actions_i AFTER INSERT ON actions BEGIN INSERT INTO fts_actions(rowid, summary) VALUES (new.id, new.summary); END;
       CREATE TRIGGER IF NOT EXISTS trg_fts_actions_d AFTER DELETE ON actions BEGIN INSERT INTO fts_actions(fts_actions, rowid, summary) VALUES('delete', old.id, old.summary); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_actions_u AFTER UPDATE ON actions BEGIN INSERT INTO fts_actions(fts_actions, rowid, summary) VALUES('delete', old.id, old.summary); INSERT INTO fts_actions(rowid, summary) VALUES (new.id, new.summary); END;
       CREATE TRIGGER IF NOT EXISTS trg_fts_dialog_i AFTER INSERT ON dialog BEGIN INSERT INTO fts_dialog(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS trg_fts_dialog_d AFTER DELETE ON dialog BEGIN INSERT INTO fts_dialog(fts_dialog, rowid, text) VALUES('delete', old.id, old.text); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_dialog_u AFTER UPDATE ON dialog BEGIN INSERT INTO fts_dialog(fts_dialog, rowid, text) VALUES('delete', old.id, old.text); INSERT INTO fts_dialog(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS trg_fts_replies_i AFTER INSERT ON assistant_replies BEGIN INSERT INTO fts_replies(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS trg_fts_replies_d AFTER DELETE ON assistant_replies BEGIN INSERT INTO fts_replies(fts_replies, rowid, text) VALUES('delete', old.id, old.text); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_replies_u AFTER UPDATE ON assistant_replies BEGIN INSERT INTO fts_replies(fts_replies, rowid, text) VALUES('delete', old.id, old.text); INSERT INTO fts_replies(rowid, text) VALUES (new.id, new.text); END;
       CREATE TRIGGER IF NOT EXISTS trg_fts_knowledge_i AFTER INSERT ON knowledge BEGIN INSERT INTO fts_knowledge(rowid, fact) VALUES (new.id, new.fact); END;
       CREATE TRIGGER IF NOT EXISTS trg_fts_knowledge_d AFTER DELETE ON knowledge BEGIN INSERT INTO fts_knowledge(fts_knowledge, rowid, fact) VALUES('delete', old.id, old.fact); END;
+      CREATE TRIGGER IF NOT EXISTS trg_fts_knowledge_u AFTER UPDATE ON knowledge BEGIN INSERT INTO fts_knowledge(fts_knowledge, rowid, fact) VALUES('delete', old.id, old.fact); INSERT INTO fts_knowledge(rowid, fact) VALUES (new.id, new.fact); END;
     `)
   }
 
@@ -93,10 +109,10 @@ async function ensureStorage() {
     .run("Persistence v4.2 SQLite (bun:sqlite). FTS5: " + (hasFTS5 ? "enabled" : "unavailable") + ". Query via memory_* tools.")
   db.prepare("INSERT OR IGNORE INTO context (id, summary, next_steps) VALUES (1, '', '')").run()
 
-  autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 30_000)
+  autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 5_000)
   if (autoSaveTimer.unref) autoSaveTimer.unref()
 
-  // Crash-safe flush
+  // Crash-safe flush — sync on exit
   const cleanup = async () => {
     if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
     try { await flush() } catch {}
@@ -192,18 +208,18 @@ function short(text, len = 120) {
 }
 
 const RE_NEXT_STEPS = [
-  /(?:todo|next|later|remember|fix|need to|must|should)[:\s]+([^\n.]{5,150})/gi,
-  /(?:сделать|нужно|надо|дальше|затем|потом|не забудь|запомни|исправить|добавить|убрать|проверить)[:\s]+([^\n.]{5,150})/gi,
+  /(?:todo|next|later|remember|fix|need to|must|should|will|going to|plan to|want to|todo:|action item)[:\s]+([^\n.]{5,200})/gi,
+  /(?:сделать|нужно|надо|дальше|затем|потом|не забудь|запомни|исправить|добавить|убрать|проверить|собираюсь|планирую|хочу)[:\s]+([^\n.]{5,200})/gi,
 ]
 
 const RE_DECISIONS = [
-  /(?:decided|chose|using|going with|will use|stick with|picked|selected|agreed on|finalized)[:\s]+([^\n.]{5,150})/gi,
-  /(?:решили|выбрали|будем использовать|отказались от|остановились на|определились с|зафиксировали|утвердили)[:\s]+([^\n.]{5,150})/gi,
+  /(?:decided|chose|using|going with|will use|stick with|picked|selected|agreed on|finalized|chosen|prefer|opted for|settled on|decision:|architecture choice|design decision)[:\s]+([^\n.]{5,200})/gi,
+  /(?:решили|выбрали|будем использовать|отказались от|остановились на|определились с|зафиксировали|утвердили|предпочли|выбрали|остановились)[:\s]+([^\n.]{5,200})/gi,
 ]
 
 const RE_FACTS = [
-  /(?:remember|note|important|key|fact|rule|convention|always|never)[:\s]+([^\n.]{5,200})/gi,
-  /(?:запомни|важно|факт|правило|конвенция|всегда|никогда|учти|имей в виду)[:\s]+([^\n.]{5,200})/gi,
+  /(?:remember|note|important|key|fact|rule|convention|always|never|use|prefer|avoid|don't|must|should know|keep in mind|note that)[:\s]+([^\n.]{5,250})/gi,
+  /(?:запомни|важно|факт|правило|конвенция|всегда|никогда|учти|имей в виду|используй|предпочитай|избегай|не используй|стоит помнить|обрати внимание)[:\s]+([^\n.]{5,250})/gi,
 ]
 
 const RE_STRUCT_ERROR = /exit code [1-9]|Traceback \(most recent|SyntaxError|TypeError|ReferenceError|ENOENT|EACCES|EPERM|Segmentation fault|FATAL/
@@ -313,7 +329,9 @@ async function rotateOldData() {
 
 async function rAction(type, summary, sessionID, tool, callID) {
   await mutex(() => {
-    stmts.iAction.run(short(summary, 150), short(summary, 150), sessionID, tool, callID)
+    // Use 500 chars for errors (need full stack traces), 300 for normal actions
+    const limit = type === "error" ? 500 : 300
+    stmts.iAction.run(short(summary, limit), short(summary, limit), sessionID, tool, callID)
     stmts.uSessionMetrics.run(tool ? 1 : 0, 1, 0, type === "error" ? 1 : 0, sessionID)
   })
 }
@@ -328,7 +346,7 @@ async function rFileChange(file, sessionID, changeType, add, del) { await mutex(
 async function rTodos(sessionID, todoList) { await mutex(() => { stmts.iTodo.run(sessionID, JSON.stringify(todoList)) }) }
 async function rSessionError(sessionID, errorType, message) {
   await mutex(() => {
-    stmts.iSessionError.run(sessionID, errorType, short(message, 300))
+    stmts.iSessionError.run(sessionID, errorType, short(message, 500))
     stmts.uPattern.run("error", errorType)
     stmts.uSessionMetrics.run(0, 0, 0, 1, sessionID)
   })
@@ -338,8 +356,13 @@ async function rPatch(sessionID, messageID, hash, files) { await mutex(() => { s
 
 async function rSession(sessionID, agent, model, projectDir) {
   await mutex(() => {
-    if (!stmts.cSession.get(sessionID).cnt) {
+    const has = stmts.cSession.get(sessionID).cnt
+    if (!has) {
       stmts.iSession.run(sessionID, new Date().toISOString(), agent || null, model?.providerID || null, model?.modelID || null, projectDir || null)
+    } else {
+      // Update if exists (fix late capture)
+      stmts.uSession = stmts.uSession || db.prepare("UPDATE sessions SET agent = ?, model_provider = ?, model_id = ?, project_dir = ? WHERE id = ?")
+      stmts.uSession.run(agent || null, model?.providerID || null, model?.modelID || null, projectDir || null, sessionID)
     }
   })
 }
@@ -369,6 +392,27 @@ function ftsSearch(query, max) {
 
 // ─── Plugin ────────────────────────────────────────────────────
 
+let selfHealAttempts = 0
+const MAX_HEAL_ATTEMPTS = 3
+
+async function selfHeal(error, context) {
+  if (selfHealAttempts >= MAX_HEAL_ATTEMPTS) return
+  selfHealAttempts++
+  debugLog("SelfHeal triggered:", error?.message, context)
+  try {
+    // Attempt 1: re-initialize DB connection
+    if (db) { try { db.close() } catch {} db = null }
+    await ensureStorage()
+    prepareStatements()
+    debugLog("SelfHeal: DB re-initialized successfully")
+    selfHealAttempts = 0 // Reset on success
+    return true
+  } catch (e) {
+    debugLog("SelfHeal failed:", e.message)
+    return false
+  }
+}
+
 export async function PersistencePlugin(input, options = {}) {
   const { client, project, directory, worktree, serverUrl } = input
   const hasFTS5 = await ensureStorage()
@@ -377,13 +421,17 @@ export async function PersistencePlugin(input, options = {}) {
   const projectDir = directory || worktree || process.cwd()
   let pendingToolOutputs = []
   const currentSessionFiles = new Set()
+  let currentSessionID = null
+  let currentModel = null
+  let currentAgent = null
+
+  debugLog("Plugin initialized", { projectDir, hasFTS5 })
 
   const tools = {
     memory_search: {
       description: "Search persistent memory across actions, dialog, replies, knowledge, files, errors. Supports time-range and FTS5 full-text search.",
       args: { type: "object", properties: { query: { type: "string", description: "Text to search" }, max: { type: "number", description: "Max per category (default 10)" }, since: { type: "string", description: "ISO date after" }, until: { type: "string", description: "ISO date before" }, fts: { type: "boolean", description: "Use FTS5 full-text search (default true if available)" } } },
-      required: ["query"]
-    },
+      required: ["query"],
       async execute(args) {
         const q = `%${args.query}%`, max = args.max || 10, r = []
         const useFTS = hasFTS5 && args.fts !== false
@@ -525,42 +573,109 @@ export async function PersistencePlugin(input, options = {}) {
     tool: tools,
 
     "experimental.chat.system.transform" : async (input, output) => {
-      try { output.system.push(`\n---\n${await buildDigest()}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4.2] Error: ${e.message}\n---\n`) }
+      try {
+        const digest = await buildDigest()
+        output.system.push(`\n---\n${digest}\n---\n`)
+        debugLog("Digest injected", digest.length, "chars")
+      } catch (e) {
+        output.system.push(`\n---\n[PERSISTENCE v4.2] Digest error: ${e.message}\n---\n`)
+        debugLog("Digest error", e.message)
+        // Attempt self-heal on digest failure
+        await selfHeal(e, "digest")
+      }
     },
 
     "chat.message": async (input, output) => {
       const text = textFromParts(output.parts)
+      // Capture session from chat.message if not yet captured
+      if (input.sessionID && !currentSessionID) {
+        currentSessionID = input.sessionID
+        await rSession(input.sessionID, currentAgent, currentModel, projectDir)
+        debugLog("Session captured from chat.message", input.sessionID)
+      }
+      // Also capture from message.updated event data if available
+      if (input.sessionID && input.sessionID !== currentSessionID) {
+        currentSessionID = input.sessionID
+        await rSession(input.sessionID, currentAgent, currentModel, projectDir)
+        debugLog("Session updated from chat.message", input.sessionID)
+      }
       if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID); await flush(); await rotateOldData() }
     },
 
     "tool.execute.after": async (input, output) => {
       const result = output.output || "", isErr = isGenuineError(input.tool, result)
-      await rAction(isErr ? "error" : "action", `${input.tool}: ${short(result, 120)}`, input.sessionID, input.tool, input.callID)
+      // Capture session from tool execution if not yet captured
+      if (input.sessionID && !currentSessionID) {
+        currentSessionID = input.sessionID
+        await rSession(input.sessionID, currentAgent, currentModel, projectDir)
+        debugLog("Session captured from tool.execute.after", input.sessionID)
+      }
+      // Also capture from message.updated event data if available
+      if (input.sessionID && input.sessionID !== currentSessionID) {
+        currentSessionID = input.sessionID
+        await rSession(input.sessionID, currentAgent, currentModel, projectDir)
+        debugLog("Session updated from tool.execute.after", input.sessionID)
+      }
+      await rAction(isErr ? "error" : "action", `${input.tool}: ${short(result, isErr ? 500 : 300)}`, input.sessionID, input.tool, input.callID)
       pendingToolOutputs.push(result); if (pendingToolOutputs.length > 5) pendingToolOutputs = pendingToolOutputs.slice(-5)
       await flush()
     },
 
     "experimental.session.compacting": async (input, output) => {
       output.context.push("[PERSISTENCE v4.2] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
+      // Snapshot full context before compacting
+      if (currentSessionID) {
+        const digest = await buildDigest()
+        await rSnapshot(currentSessionID, `compact-${Date.now()}`, digest)
+      }
       await flush()
     },
 
     event: async ({ event }) => {
+      debugLog("Event received:", event.type, event.properties?.sessionID || event.properties?.info?.id)
       switch (event.type) {
         case "session.created": {
           const info = event.properties?.info, sid = info?.id || event.properties?.sessionID
-          if (sid) await rSession(sid, info?.agent, info?.model, projectDir)
+          if (sid) {
+            currentSessionID = sid
+            currentAgent = info?.agent
+            currentModel = info?.model
+            await rSession(sid, info?.agent, info?.model, projectDir)
+            debugLog("Session created event captured", sid)
+          }
+          break
+        }
+        case "session.updated": {
+          const info = event.properties?.info
+          if (info?.id) {
+            currentSessionID = info.id
+            currentAgent = info?.agent || currentAgent
+            currentModel = info?.model || currentModel
+            await rSession(info.id, currentAgent, currentModel, projectDir)
+            debugLog("Session updated event captured", info.id)
+          }
           break
         }
         case "session.deleted": case "session.compacted": {
           const sid = event.properties?.sessionID
-          if (sid) await rCloseSession(sid, event.type === "session.deleted" ? "deleted" : "compacted")
+          if (sid) { await rCloseSession(sid, event.type === "session.deleted" ? "deleted" : "compacted"); currentSessionID = null }
           break
         }
         case "message.updated": {
           const info = event.properties?.info
-          if (info?.role === "assistant" && info.time?.completed && info.error)
-            await rSessionError(info.sessionID, info.error.name, info.error.data?.message || "Unknown")
+          if (!info) break
+          // Capture assistant replies
+          if (info.role === "assistant" && info.time?.completed) {
+            const sessionID = info.sessionID || currentSessionID
+            if (sessionID) {
+              // Extract text from parts if available
+              let text = ""
+              if (info.parts) text = textFromParts(info.parts)
+              else if (info.content) text = typeof info.content === 'string' ? info.content : JSON.stringify(info.content)
+              if (text) await rReply(text, info.toolCalls || info.tool_calls, sessionID, info.id, info.model?.id || info.modelID, info.agent)
+              if (info.error) await rSessionError(sessionID, info.error.name, info.error.data?.message || "Unknown")
+            }
+          }
           break
         }
         case "message.part.updated": {
@@ -595,8 +710,8 @@ export async function PersistencePlugin(input, options = {}) {
 
     async dispose() {
       if (autoSaveTimer) { clearInterval(autoSaveTimer); autoSaveTimer = null }
-      await flush()
-      if (db) { db.close(); db = null }
+      try { await flush() } catch (e) { await selfHeal(e, "dispose") }
+      if (db) { try { db.close() } catch {}; db = null }
     },
   }
 }
