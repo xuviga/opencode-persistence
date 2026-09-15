@@ -51,6 +51,71 @@ async function ensureStorage() {
     debugLog("Migration: created archive table")
   }
 
+  // Migration 1: knowledge project_dir + TTL
+  try {
+    const knCols = db.prepare("PRAGMA table_info(knowledge)").all().map(c => c.name)
+    if (!knCols.includes('project_dir')) {
+      db.exec("ALTER TABLE knowledge ADD COLUMN project_dir TEXT")
+      db.exec("CREATE INDEX IF NOT EXISTS idx_knowledge_project ON knowledge(project_dir)")
+      debugLog("Migration: added knowledge.project_dir")
+    }
+    if (!knCols.includes('expires_at')) {
+      db.exec("ALTER TABLE knowledge ADD COLUMN expires_at TEXT")
+      db.exec("CREATE INDEX IF NOT EXISTS idx_knowledge_expires ON knowledge(expires_at)")
+      debugLog("Migration: added knowledge.expires_at")
+    }
+  } catch(e) { debugLog("Migration knowledge cols error:", e.message) }
+
+  // Migration 2: synonyms table
+  if (!tables.includes('synonyms')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS synonyms (id INTEGER PRIMARY KEY AUTOINCREMENT, term TEXT NOT NULL, synonym TEXT NOT NULL, lang TEXT DEFAULT 'en', created_at TEXT DEFAULT (datetime('now')), UNIQUE(term, synonym));
+      CREATE INDEX IF NOT EXISTS idx_synonyms_term ON synonyms(term);
+    `)
+    debugLog("Migration: created synonyms table")
+  }
+
+  // Migration 3: sessions active_seconds
+  try {
+    const sessCols = db.prepare("PRAGMA table_info(sessions)").all().map(c => c.name)
+    if (!sessCols.includes('active_seconds')) {
+      db.exec("ALTER TABLE sessions ADD COLUMN active_seconds INTEGER DEFAULT 0")
+      debugLog("Migration: added sessions.active_seconds")
+    }
+  } catch(e) { debugLog("Migration sessions col error:", e.message) }
+
+  // Migration 4: snapshots prev_snapshot_id + hash
+  try {
+    const snapCols = db.prepare("PRAGMA table_info(snapshots)").all().map(c => c.name)
+    if (!snapCols.includes('prev_snapshot_id')) {
+      db.exec("ALTER TABLE snapshots ADD COLUMN prev_snapshot_id INTEGER")
+      db.exec("ALTER TABLE snapshots ADD COLUMN content_hash TEXT")
+      db.exec("CREATE INDEX IF NOT EXISTS idx_snapshots_hash ON snapshots(content_hash)")
+      debugLog("Migration: added snapshots.prev_snapshot_id + content_hash")
+    }
+  } catch(e) { debugLog("Migration snapshots cols error:", e.message) }
+
+  // Migration 5: webhooks table
+  if (!tables.includes('webhooks')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS webhooks (id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, pattern TEXT NOT NULL, action TEXT NOT NULL, enabled INTEGER DEFAULT 1, created_at TEXT DEFAULT (datetime('now')), last_triggered TEXT);
+      CREATE INDEX IF NOT EXISTS idx_webhooks_event ON webhooks(event_type);
+    `)
+    debugLog("Migration: created webhooks table")
+    // Seed useful webhooks
+    db.prepare("INSERT OR IGNORE INTO webhooks (event_type, pattern, action) VALUES (?, ?, ?)").run("error", "FTS5.*corrupt", "self_heal_fts")
+    db.prepare("INSERT OR IGNORE INTO webhooks (event_type, pattern, action) VALUES (?, ?, ?)").run("error", "database.*locked", "retry_with_backoff")
+  }
+
+  // Migration 6: knowledge is_global flag
+  try {
+    const knCols2 = db.prepare("PRAGMA table_info(knowledge)").all().map(c => c.name)
+    if (!knCols2.includes('is_global')) {
+      db.exec("ALTER TABLE knowledge ADD COLUMN is_global INTEGER DEFAULT 0")
+      debugLog("Migration: added knowledge.is_global")
+    }
+  } catch(e) { debugLog("Migration knowledge.is_global error:", e.message) }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id=1), name TEXT NOT NULL, role TEXT NOT NULL, notes TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT DEFAULT 'active', agent TEXT, model_provider TEXT, model_id TEXT, project_dir TEXT, tool_count INTEGER DEFAULT 0, action_count INTEGER DEFAULT 0, dialog_count INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0);
@@ -145,12 +210,12 @@ function prepareStatements() {
   stmts.iFileChange = db.prepare("INSERT INTO file_changes (file, session_id, change_type, additions, deletions) VALUES (?, ?, ?, ?, ?)")
   stmts.iTodo = db.prepare("INSERT INTO todos (session_id, todos_json) VALUES (?, ?)")
   stmts.iSessionError = db.prepare("INSERT INTO session_errors (session_id, error_type, message) VALUES (?, ?, ?)")
-  stmts.iSnapshot = db.prepare("INSERT INTO snapshots (session_id, message_id, snapshot) VALUES (?, ?, ?)")
+  stmts.iSnapshot = db.prepare("INSERT INTO snapshots (session_id, message_id, snapshot, prev_snapshot_id, content_hash) VALUES (?, ?, ?, ?, ?)")
   stmts.iPatch = db.prepare("INSERT INTO patches (session_id, message_id, hash, files) VALUES (?, ?, ?, ?)")
   stmts.iSession = db.prepare("INSERT OR IGNORE INTO sessions (id, started_at, status, agent, model_provider, model_id, project_dir) VALUES (?, ?, 'active', ?, ?, ?, ?)")
   stmts.uCloseSession = db.prepare("UPDATE sessions SET status = ?, ended_at = datetime('now') WHERE id = ?")
   stmts.uPattern = db.prepare("INSERT INTO patterns (category, value, count) VALUES (?, ?, 1) ON CONFLICT(category, value) DO UPDATE SET count = count + 1, last_seen = datetime('now')")
-  stmts.upsertKnowledge = db.prepare("INSERT OR IGNORE INTO knowledge (fact, source, session_id) VALUES (?, ?, ?)")
+  stmts.upsertKnowledge = db.prepare("INSERT OR IGNORE INTO knowledge (fact, source, session_id, project_dir, is_global, expires_at) VALUES (?, ?, ?, ?, ?, ?)")
   stmts.uContext = db.prepare("UPDATE context SET summary = ?, next_steps = ?, updated_at = datetime('now') WHERE id = 1")
   stmts.uSessionMetrics = db.prepare("UPDATE sessions SET tool_count = tool_count + ?, action_count = action_count + ?, dialog_count = dialog_count + ?, error_count = error_count + ? WHERE id = ?")
   stmts.iConfigHistory = db.prepare("INSERT INTO config_history (session_id, key, value) VALUES (?, ?, ?)")
@@ -190,6 +255,17 @@ function prepareStatements() {
   stmts.dOldDialog = db.prepare("DELETE FROM dialog WHERE created_at < ? AND id <= ?")
   stmts.dOldReplies = db.prepare("DELETE FROM assistant_replies WHERE created_at < ? AND id <= ?")
   stmts.cSession = db.prepare("SELECT COUNT(*) as cnt FROM sessions WHERE id = ?")
+
+  // New statements for v4.3 features
+  stmts.gKnowledgeGlobal = db.prepare("SELECT * FROM knowledge WHERE (project_dir = ? OR project_dir IS NULL OR is_global = 1) ORDER BY created_at DESC LIMIT ?")
+  stmts.gKnowledgeExpired = db.prepare("SELECT * FROM knowledge WHERE expires_at IS NOT NULL AND expires_at < datetime('now') ORDER BY expires_at ASC LIMIT ?")
+  stmts.dKnowledgeExpired = db.prepare("DELETE FROM knowledge WHERE expires_at IS NOT NULL AND expires_at < datetime('now')")
+  stmts.gSynonyms = db.prepare("SELECT synonym FROM synonyms WHERE term = ? OR term = ?")
+  stmts.iSynonym = db.prepare("INSERT OR IGNORE INTO synonyms (term, synonym, lang) VALUES (?, ?, ?)")
+  stmts.gLatestSnapshot = db.prepare("SELECT * FROM snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1")
+  stmts.uSessionActive = db.prepare("UPDATE sessions SET active_seconds = CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER) WHERE id = ?")
+  stmts.gWebhooks = db.prepare("SELECT * FROM webhooks WHERE enabled = 1 AND event_type = ?")
+  stmts.uWebhookLast = db.prepare("UPDATE webhooks SET last_triggered = datetime('now') WHERE id = ?")
 }
 
 // ─── Text utils ─────────────────────────────────────────────────
@@ -226,6 +302,105 @@ const RE_STRUCT_ERROR = /exit code [1-9]|Traceback \(most recent|SyntaxError|Typ
 const RE_ERROR_LINE = /^\s*(Error|Exception|Failed|FAIL|FATAL|fatal:)/m
 const RE_GENERIC_ERROR = /\b(error|failed|failure|exception|crash|panic|fatal|errno|timeout|denied|refused|not found|404|500|502|503)\b/i
 
+// ─── DB Backup ─────────────────────────────────────────────────
+
+const BACKUP_DIR = path.join(MEMORY_DIR, "backups")
+let lastBackup = 0
+
+async function backupDb() {
+  const now = Date.now()
+  if (now - lastBackup < 24 * 60 * 60 * 1000) return // 24h
+  try {
+    await mkdir(BACKUP_DIR, { recursive: true })
+    const stamp = new Date().toISOString().slice(0, 10)
+    const dest = path.join(BACKUP_DIR, `memory-${stamp}.db`)
+    const src = Bun.file(DB_PATH)
+    await Bun.write(dest, src)
+    // Keep last 7 backups
+    const { readdirSync, statSync, unlinkSync } = await import("fs")
+    const files = readdirSync(BACKUP_DIR)
+      .filter(f => f.startsWith("memory-") && f.endsWith(".db"))
+      .map(f => ({ f, t: statSync(path.join(BACKUP_DIR, f)).mtimeMs }))
+      .sort((a, b) => b.t - a.t)
+    for (const f of files.slice(7)) {
+      try { unlinkSync(path.join(BACKUP_DIR, f.f)) } catch {}
+    }
+    lastBackup = now
+    debugLog("DB backup completed:", dest)
+  } catch (e) { debugLog("DB backup failed:", e.message) }
+}
+
+// ─── Knowledge TTL cleanup ─────────────────────────────────────
+
+let lastTtlCheck = 0
+const TTL_CHECK_INTERVAL = 60 * 60 * 1000 // 1h
+
+async function cleanExpiredKnowledge() {
+  const now = Date.now()
+  if (now - lastTtlCheck < TTL_CHECK_INTERVAL) return
+  lastTtlCheck = now
+  await mutex(async () => {
+    const expired = stmts.gKnowledgeExpired.all(100)
+    if (expired.length) {
+      for (const k of expired) {
+        stmts.iArchive.run("knowledge", JSON.stringify(k), k.created_at)
+      }
+      stmts.dKnowledgeExpired.run()
+      debugLog(`Archived ${expired.length} expired knowledge entries`)
+    }
+  })
+}
+
+// ─── RU Stemming helper ───────────────────────────────────────
+
+function stemRu(word) {
+  // Simple RU suffix stripping for FTS
+  const suffixes = ['ого','его','ами','ями','ов','ев','ей','ам','ям','ах','ях','ом','ем','ой','ей','ую','юю','ая','яя','ое','ее','ый','ий']
+  for (const s of suffixes) {
+    if (word.length > 4 && word.endsWith(s)) return word.slice(0, -s.length)
+  }
+  return word
+}
+
+function expandQueryWithSynonyms(query) {
+  const words = query.split(/\s+/).filter(w => w.length > 2)
+  const expanded = new Set()
+  for (const w of words) {
+    expanded.add(w)
+    expanded.add(stemRu(w))
+    try {
+      const rows = stmts.gSynonyms.all(w.toLowerCase(), w)
+      for (const r of rows) expanded.add(r.synonym)
+    } catch {}
+  }
+  return [...expanded].join(" OR ")
+}
+
+// ─── Webhook dispatcher ───────────────────────────────────────
+
+async function triggerWebhooks(eventType, payload) {
+  try {
+    const hooks = stmts.gWebhooks.all(eventType)
+    for (const hook of hooks) {
+      try {
+        if (new RegExp(hook.pattern, "i").test(JSON.stringify(payload))) {
+          debugLog(`Webhook triggered: ${hook.action} for ${eventType}`)
+          if (hook.action === "self_heal_fts") await selfHeal(null, "webhook:fts_corrupt")
+          await stmts.uWebhookLast.run(hook.id)
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+// ─── Hash util ────────────────────────────────────────────────
+
+function quickHash(str) {
+  let h = 0
+  for (let i = 0; i < str.length; i++) { h = ((h << 5) - h + str.charCodeAt(i)) | 0 }
+  return Math.abs(h).toString(36)
+}
+
 function isGenuineError(toolName, output) {
   if (!output) return false
   const s = String(output).slice(0, 3000)
@@ -246,30 +421,73 @@ function textFromParts(parts) { return parts ? parts.filter((p) => p.type === "t
 function fmt(iso) { return iso ? iso.replace("T", " ").slice(0, 19) : "?" }
 function epochMs(iso) { return iso ? new Date(iso).getTime() : 0 }
 
-// ─── Digest ─────────────────────────────────────────────────────
+// ─── Digest (Prioritized) ─────────────────────────────────────
 
-async function buildDigest() {
+async function buildDigest(projectDir) {
   const lines = [], id = stmts.gIdentity.get(), ctx = stmts.gContext.get(), st = stmts.gStats.get()
     , rs = stmts.gSessions.all(5), ra = stmts.gActions.all(7), rd = stmts.gDialog.all(5)
     , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
-    , kn = stmts.gKnowledge.all(10), rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
+    , kn = projectDir ? stmts.gKnowledgeGlobal.all(projectDir, 10) : stmts.gKnowledge.all(10)
+    , rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
 
-  lines.push("[AUTONOMOUS PERSISTENCE v4.2] Active. Full self-awareness enabled.")
+  // Priority 0: Critical errors first (most actionable)
+  if (re.length) {
+    lines.push("CRITICAL — Recent session errors:")
+    for (const e of re.slice(0, 3)) lines.push(`  [${e.error_type}] ${short(e.message, 150)} (${fmt(e.created_at)})`)
+  }
+
+  // Priority 1: Identity + handoff
+  lines.push("[AUTONOMOUS PERSISTENCE v4.3] Active. Full self-awareness enabled.")
   lines.push("Use memory_* tools to query this store. All data auto-captured below.")
   lines.push(`Identity: ${id.name} (${id.role})`)
   if (id.notes) lines.push(`Identity notes: ${id.notes}`)
   if (ctx?.summary) lines.push(`Previous session handoff: ${ctx.summary}`)
   if (ctx?.next_steps) { try { const s = JSON.parse(ctx.next_steps); if (s.length) { lines.push("Pending next steps:"); for (const x of s) lines.push(`  - ${x}`) } } catch {} }
+
+  // Priority 2: Stats
   lines.push(`Memory: ${st.s} sessions, ${st.a} actions, ${st.d} dialog, ${st.r} replies, ${st.f} files, ${st.se} errors, ${st.ch} config changes, ${st.ar} archived`)
-  if (rs.length) { lines.push("Recent sessions:"); for (const s of rs) { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; const dur = s.ended_at ? `${Math.round((epochMs(s.ended_at) - epochMs(s.started_at)) / 60000)}min` : "running"; lines.push(`  ${s.id.slice(-8)}(${s.status})${m} ${fmt(s.started_at)} → ${dur}, tools:${s.tool_count || 0} acts:${s.action_count || 0} errs:${s.error_count || 0}`) } }
-  if (re.length) { lines.push("Recent session errors:"); for (const e of re.slice(0, 3)) lines.push(`  [${e.error_type}] ${short(e.message, 100)} (${fmt(e.created_at)})`) }
-  if (ra.length) { lines.push("Latest actions:"); for (const a of ra.slice(0, 5)) lines.push(`  [${a.type}] ${short(a.summary, 100)}`) }
-  if (rr.length) { lines.push("My latest replies:"); for (const r of rr.slice(0, 2)) lines.push(`  ${short(r.text, 80)}`) }
+
+  // Priority 3: Sessions + active time
+  if (rs.length) {
+    lines.push("Recent sessions:")
+    for (const s of rs) {
+      const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""
+      const dur = s.ended_at ? `${Math.round((epochMs(s.ended_at) - epochMs(s.started_at)) / 60000)}min` : "running"
+      const active = s.active_seconds ? ` active:${Math.round(s.active_seconds / 60)}min` : ""
+      lines.push(`  ${s.id.slice(-8)}(${s.status})${m}${active} ${fmt(s.started_at)} → ${dur}, tools:${s.tool_count || 0} acts:${s.action_count || 0} errs:${s.error_count || 0}`)
+    }
+  }
+
+  // Priority 4: Latest actions (errors first)
+  if (ra.length) {
+    lines.push("Latest actions:")
+    const sorted = [...ra].sort((a, b) => (a.type === "error" ? -1 : 1) - (b.type === "error" ? -1 : 1))
+    for (const a of sorted.slice(0, 5)) lines.push(`  [${a.type}] ${short(a.summary, 120)}`)
+  }
+
+  // Priority 5: My latest replies
+  if (rr.length) { lines.push("My latest replies:"); for (const r of rr.slice(0, 2)) lines.push(`  ${short(r.text, 100)}`) }
+
+  // Priority 6: Recent user requests
   if (rd.length) { lines.push("Recent user requests:"); for (const d of rd.slice(0, 3)) lines.push(`  - ${short(d.text, 120)}`) }
+
+  // Priority 7: Files
   if (rf.length) lines.push(`Recently edited files: ${rf.map((f) => `${f.file}(${f.edits}x)`).join(", ")}`)
+
+  // Priority 8: Active todos
   if (lt?.todos_json) { try { const tl = JSON.parse(lt.todos_json); const ac = tl.filter((t) => t.status !== "completed"); if (ac.length) { lines.push(`Active todos (${ac.length}):`); for (const t of ac.slice(0, 5)) lines.push(`  [${t.status}] ${short(t.content, 80)}`) } } catch {} }
+
+  // Priority 9: Key decisions
   if (dec.length) lines.push(`Key decisions: ${dec.map((d) => d.value).join("; ")}`)
-  if (kn.length) { lines.push("Accumulated knowledge:"); for (const k of kn.slice(0, 5)) lines.push(`  - ${short(k.fact, 140)}`) }
+
+  // Priority 10: Accumulated knowledge (project-scoped)
+  if (kn.length) {
+    const projKn = kn.filter(k => !k.is_global && k.project_dir === projectDir)
+    const globalKn = kn.filter(k => k.is_global || !k.project_dir)
+    if (projKn.length) { lines.push("Project knowledge:"); for (const k of projKn.slice(0, 5)) lines.push(`  - ${short(k.fact, 140)}`) }
+    if (globalKn.length) { lines.push("Global knowledge:"); for (const k of globalKn.slice(0, 5)) lines.push(`  - ${short(k.fact, 140)}`) }
+  }
+
   return lines.join("\n")
 }
 
@@ -290,6 +508,9 @@ async function flush() {
     if (actions.length) parts.push(`Did: ${actions.map((a) => short(a.summary, 60)).join(" | ")}`)
     stmts.uContext.run(parts.join("; ") || "Active session.", JSON.stringify(deriveNextSteps()))
   })
+  // Maintenance tasks
+  await backupDb()
+  await cleanExpiredKnowledge()
 }
 
 // ─── Smart digest rotation ─────────────────────────────────────
@@ -344,14 +565,16 @@ async function rDialog(text, role, sessionID) {
 async function rReply(text, toolCalls, sessionID, messageID, model, agent) { await mutex(() => { stmts.iReply.run(short(text, 800), JSON.stringify(toolCalls || []), sessionID, messageID, model, agent) }) }
 async function rFileChange(file, sessionID, changeType, add, del) { await mutex(() => { stmts.iFileChange.run(file, sessionID, changeType || "edit", add || 0, del || 0) }) }
 async function rTodos(sessionID, todoList) { await mutex(() => { stmts.iTodo.run(sessionID, JSON.stringify(todoList)) }) }
-async function rSessionError(sessionID, errorType, message) {
+async function rSnapshot(sessionID, messageID, snapshotData) {
   await mutex(() => {
-    stmts.iSessionError.run(sessionID, errorType, short(message, 500))
-    stmts.uPattern.run("error", errorType)
-    stmts.uSessionMetrics.run(0, 0, 0, 1, sessionID)
+    const hash = quickHash(snapshotData)
+    const prev = stmts.gLatestSnapshot.get(sessionID)
+    const prevId = prev?.id || null
+    // Skip if identical to previous
+    if (prev?.content_hash === hash) return
+    stmts.iSnapshot.run(sessionID, messageID, short(snapshotData, 500), prevId, hash)
   })
 }
-async function rSnapshot(sessionID, messageID, snapshotData) { await mutex(() => { stmts.iSnapshot.run(sessionID, messageID, short(snapshotData, 500)) }) }
 async function rPatch(sessionID, messageID, hash, files) { await mutex(() => { stmts.iPatch.run(sessionID, messageID, hash, JSON.stringify(files)) }) }
 
 async function rSession(sessionID, agent, model, projectDir) {
@@ -368,8 +591,27 @@ async function rSession(sessionID, agent, model, projectDir) {
 }
 async function rCloseSession(sessionID, status) { await mutex(() => { stmts.uCloseSession.run(status, sessionID) }) }
 async function rDecision(text) { await mutex(() => { for (const d of extractPatterns(text, RE_DECISIONS)) stmts.uPattern.run("decision", d) }) }
-async function rKnowledge(text, sessionID) { await mutex(() => { for (const f of extractPatterns(text, RE_FACTS)) stmts.upsertKnowledge.run(f, sessionID || null) }) }
+async function rKnowledge(text, sessionID, projectDir, isGlobal = false) {
+  await mutex(() => {
+    for (const f of extractPatterns(text, RE_FACTS)) {
+      // Default TTL: 30 days for non-global, 90 for global
+      const expiresAt = new Date(Date.now() + (isGlobal ? 90 : 30) * 24 * 60 * 60 * 1000).toISOString()
+      stmts.upsertKnowledge.run(f, sessionID || null, projectDir || null, isGlobal ? 1 : 0, expiresAt)
+    }
+  })
+}
 async function rConfigChange(sessionID, key, value) { await mutex(() => { stmts.iConfigHistory.run(sessionID, key, short(String(value), 200)) }) }
+async function rSynonym(term, synonym, lang = "en") { await mutex(() => { stmts.iSynonym.run(term.toLowerCase(), synonym.toLowerCase(), lang) }) }
+
+async function rSessionError(sessionID, errorType, message) {
+  await mutex(() => {
+    stmts.iSessionError.run(sessionID, errorType, short(message, 500))
+    stmts.uPattern.run("error", errorType)
+    stmts.uSessionMetrics.run(0, 0, 0, 1, sessionID)
+  })
+  // Trigger webhooks for error patterns
+  await triggerWebhooks("error", { errorType, message, sessionID })
+}
 
 // ─── FTS5 search ───────────────────────────────────────────────
 
@@ -428,6 +670,71 @@ export async function PersistencePlugin(input, options = {}) {
   debugLog("Plugin initialized", { projectDir, hasFTS5 })
 
   const tools = {
+    memory_ask: {
+      description: "Unified memory query — ask anything in natural language. Routes to search, errors, files, sessions, decisions automatically.",
+      args: { type: "object", properties: { q: { type: "string", description: "Natural language query" }, max: { type: "number", description: "Max results (default 10)" } } },
+      required: ["q"],
+      async execute(args) {
+        const q = (args.q || "").toLowerCase(), max = args.max || 10, r = []
+        const isRu = /[а-яё]/i.test(q)
+
+        // Intent detection
+        if (/(ошиб|fail|exception|error|crash|panic)/.test(q)) {
+          const se = stmts.gSessionErrors.all(max)
+          if (se.length) { r.push("## Errors"); se.slice(0, max).forEach(e => r.push(`  [${e.error_type}] ${short(e.message, 120)} (${fmt(e.created_at)})`)) }
+          const et = stmts.gErrorsByType.all(5)
+          if (et.length) { r.push("## Frequency"); et.forEach(b => r.push(`  [${b.count}x] ${b.error_type}`)) }
+        }
+        else if (/(файл|file|edit|измен|модиф)/.test(q)) {
+          const rows = stmts.gFilesAgg.all(max)
+          if (rows.length) { r.push("## Files"); rows.forEach(f => r.push(`  ${f.file}: ${f.edits} edits, +${f.total_add || 0} -${f.total_del || 0} (${fmt(f.last_edit)})`)) }
+        }
+        else if (/(решени|decision|chose|pick|select|выбра)/.test(q)) {
+          const dec = stmts.gDecisions.all(max)
+          if (dec.length) { r.push("## Decisions"); dec.forEach(d => r.push(`  - ${d.value} (${d.count}x)`)) }
+        }
+        else if (/(сесси|session|когда|when|запуск|start)/.test(q)) {
+          const rows = stmts.gSessions.all(max)
+          if (rows.length) { r.push("## Sessions"); rows.forEach(s => { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; const dur = s.ended_at ? Math.round((epochMs(s.ended_at) - epochMs(s.started_at)) / 60000) + "min" : "running"; r.push(`  ${s.id.slice(-8)} ${s.status}${m} ${fmt(s.started_at)} → ${dur}`) }) }
+        }
+        else if (/(сделал|did|action|действ|выполн)/.test(q)) {
+          const rows = stmts.gActions.all(max)
+          if (rows.length) { r.push("## Actions"); rows.forEach(a => r.push(`  [${a.type}] ${short(a.summary, 120)} (${fmt(a.created_at)})`)) }
+        }
+
+        // Fallback: FTS search
+        if (!r.length) {
+          const expanded = expandQueryWithSynonyms(q)
+          if (expanded && expanded.length > 3) {
+            const rows = ftsSearch(expanded, max)
+            if (rows?.length) {
+              const groups = {}
+              for (const row of rows) { if (!groups[row.src]) groups[row.src] = []; groups[row.src].push(row) }
+              for (const [src, rws] of Object.entries(groups)) {
+                r.push(`## ${src.charAt(0).toUpperCase() + src.slice(1)} (FTS)`)
+                rws.forEach(row => r.push(`  [${row.src}] ${short(row.text, 120)} (${fmt(row.created_at)})`))
+              }
+            }
+          }
+        }
+
+        return r.length ? r.join("\n") : (isRu ? "Ничего не найдено. Попробуй: ошибки, файлы, решения, сессии, действия" : "No results. Try: errors, files, decisions, sessions, actions")
+      }
+    },
+    memory_synonyms: {
+      description: "Manage search synonyms. Add/list term-synonym pairs for better FTS.",
+      args: { type: "object", properties: { term: { type: "string" }, synonym: { type: "string" }, lang: { type: "string", description: "Language: en/ru (default en)" }, list: { type: "boolean" } } },
+      async execute(args) {
+        if (args.list) {
+          const rows = db.prepare("SELECT * FROM synonyms ORDER BY term LIMIT 50").all()
+          if (!rows.length) return "No synonyms registered."
+          return rows.map(s => `${s.term} → ${s.synonym} [${s.lang}]`).join("\n")
+        }
+        if (!args.term || !args.synonym) return "Usage: memory_synonyms(term=\"auth\", synonym=\"login\", lang=\"en\") or memory_synonyms(list=true)"
+        await rSynonym(args.term, args.synonym, args.lang || "en")
+        return `Synonym added: ${args.term} → ${args.synonym} [${args.lang || "en"}]`
+      }
+    },
     memory_search: {
       description: "Search persistent memory across actions, dialog, replies, knowledge, files, errors. Supports time-range and FTS5 full-text search.",
       args: { type: "object", properties: { query: { type: "string", description: "Text to search" }, max: { type: "number", description: "Max per category (default 10)" }, since: { type: "string", description: "ISO date after" }, until: { type: "string", description: "ISO date before" }, fts: { type: "boolean", description: "Use FTS5 full-text search (default true if available)" } } },
@@ -436,9 +743,10 @@ export async function PersistencePlugin(input, options = {}) {
         const q = `%${args.query}%`, max = args.max || 10, r = []
         const useFTS = hasFTS5 && args.fts !== false
 
-        // FTS5 full-text search
+        // FTS5 full-text search (with synonym expansion)
         if (useFTS && !args.since) {
-          const ftsResults = ftsSearch(args.query, max)
+          const expanded = expandQueryWithSynonyms(args.query)
+          const ftsResults = ftsSearch(expanded || args.query, max)
           if (ftsResults?.length) {
             const groups = {}
             for (const row of ftsResults) {
@@ -574,11 +882,11 @@ export async function PersistencePlugin(input, options = {}) {
 
     "experimental.chat.system.transform" : async (input, output) => {
       try {
-        const digest = await buildDigest()
+        const digest = await buildDigest(projectDir)
         output.system.push(`\n---\n${digest}\n---\n`)
         debugLog("Digest injected", digest.length, "chars")
       } catch (e) {
-        output.system.push(`\n---\n[PERSISTENCE v4.2] Digest error: ${e.message}\n---\n`)
+        output.system.push(`\n---\n[PERSISTENCE v4.3] Digest error: ${e.message}\n---\n`)
         debugLog("Digest error", e.message)
         // Attempt self-heal on digest failure
         await selfHeal(e, "digest")
@@ -599,7 +907,7 @@ export async function PersistencePlugin(input, options = {}) {
         await rSession(input.sessionID, currentAgent, currentModel, projectDir)
         debugLog("Session updated from chat.message", input.sessionID)
       }
-      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID); await flush(); await rotateOldData() }
+      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID, projectDir); await flush(); await rotateOldData() }
     },
 
     "tool.execute.after": async (input, output) => {
@@ -622,11 +930,15 @@ export async function PersistencePlugin(input, options = {}) {
     },
 
     "experimental.session.compacting": async (input, output) => {
-      output.context.push("[PERSISTENCE v4.2] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
+      output.context.push("[PERSISTENCE v4.3] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
       // Snapshot full context before compacting
       if (currentSessionID) {
-        const digest = await buildDigest()
+        const digest = await buildDigest(projectDir)
         await rSnapshot(currentSessionID, `compact-${Date.now()}`, digest)
+      }
+      // Update active seconds
+      if (currentSessionID) {
+        try { stmts.uSessionActive.run(new Date().toISOString(), currentSessionID) } catch {}
       }
       await flush()
     },
@@ -658,7 +970,12 @@ export async function PersistencePlugin(input, options = {}) {
         }
         case "session.deleted": case "session.compacted": {
           const sid = event.properties?.sessionID
-          if (sid) { await rCloseSession(sid, event.type === "session.deleted" ? "deleted" : "compacted"); currentSessionID = null }
+          if (sid) {
+            await rCloseSession(sid, event.type === "session.deleted" ? "deleted" : "compacted")
+            // Update active seconds on close
+            try { stmts.uSessionActive.run(new Date().toISOString(), sid) } catch {}
+            currentSessionID = null
+          }
           break
         }
         case "message.updated": {
