@@ -300,6 +300,69 @@ export async function PersistencePlugin(input, options = {}) {
         return l.join("\n")
       }
     },
+    memory_ask: {
+      description: "Unified memory query — ask anything. Routes to search, errors, files, decisions, emotions, revisions, connections.",
+      args: { type: "object", properties: { q: { type: "string", description: "Natural language query" }, max: { type: "number", description: "Max results (default 10)" } } },
+      required: ["q"],
+      async execute(args) {
+        const q = (args.q || "").toLowerCase(), max = args.max || 10, r = []
+
+        // Intent detection using regex (fast, no LLM needed)
+        if (/(ошиб|fail|exception|error|crash|panic|anomal)/.test(q)) {
+          const se = stmts.gSessionErrors.all(max)
+          if (se.length) { r.push("## Errors"); se.slice(0, max).forEach(e => r.push(`  [${e.error_type}] ${short(e.message, 120)} (${fmt(e.created_at)})`)) }
+        }
+        else if (/(решени|decision|chose|pick|select|выбра)/.test(q)) {
+          const dec = stmts.gDecisions.all(max)
+          if (dec.length) { r.push("## Decisions"); dec.forEach(d => r.push(`  - ${d.value} (${d.count}x)`)) }
+        }
+        else if (/(файл|file|edit|измен|модиф)/.test(q)) {
+          const rows = stmts.gFilesAgg.all(max)
+          if (rows.length) { r.push("## Files"); rows.forEach(f => r.push(
+            "  " + f.file + ": " + f.edits + " edits, +" + (f.total_add || 0) + " -" + (f.total_del || 0) + " (" + fmt(f.last_edit) + ")"
+          )) }
+        }
+        else if (/(сесси|session|когда|when|запуск|start)/.test(q)) {
+          const rows = stmts.gSessions.all(max)
+          if (rows.length) { r.push("## Sessions"); rows.forEach(s => { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; const dur = s.ended_at ? Math.round((epochMs(s.ended_at) - epochMs(s.started_at)) / 60000) + "min" : "running"; r.push(`  ${s.id.slice(-8)} ${s.status}${m} ${fmt(s.started_at)} → ${dur}`) }) }
+        }
+        else if (/(сделал|did|action|действ|выполн)/.test(q)) {
+          const rows = stmts.gActions.all(max)
+          if (rows.length) { r.push("## Actions"); rows.forEach(a => r.push(`  [${a.type}] ${short(a.summary, 120)} (${fmt(a.created_at)})`)) }
+        }
+        else if (/(meta|decision|reasoning|thought|thinking)/.test(q)) {
+          const rows = stmts.iMeta.all(max)
+          if (rows.length) { r.push("## Meta-cognitive"); rows.forEach(e => r.push(`  [${e.decision}] ${short(e.reasoning, 120)} (${fmt(e.created_at)})`)) }
+        }
+        else if (/(emotion|angry|frustrated|annoyed|happy|sad|чувств|злы|рад)/.test(q)) {
+          const rows = stmts.iUserEmotion.all(max)
+          if (rows.length) { r.push("## Emotions"); rows.forEach(e => r.push(`  [${e.emotion_type}] ${e.intensity} (${short(e.trigger_text, 100)})`)) }
+        }
+        else if (/(revision|review|check|assess|self)/.test(q)) {
+          const rows = stmts.iRevision.all(max)
+          if (rows.length) { r.push("## Autonomous revision"); rows.forEach(e => r.push(`  Action #${e.action_count}: ${short(e.assessment, 100)}`)) }
+        }
+        else if (/(hidden|connect|link|related|between)/.test(q)) {
+          const rows = stmts.iHidden.all(max)
+          if (rows.length) { r.push("## Hidden connections"); rows.forEach(e => r.push(`  [${e.pattern_type}] ${short(e.pattern_value, 100)} (strength: ${e.strength})`)) }
+        }
+
+        // Fallback: generic search
+        if (!r.length) {
+          const expanded = expandQueryWithSynonyms(q)
+          if (expanded && expanded.length > 3) {
+            const rows = ftsSearch(expanded, max)
+            if (rows?.length) {
+              for (const row of rows) {
+                r.push(`  [${row.src}] ${short(row.text, 120)} (${fmt(row.created_at)})`)
+              }
+            }
+          }
+        }
+
+        return r.length ? r.join("\n") : "No results. Try: errors, decisions, files, sessions, actions, meta, emotions, revisions, connections"
+      }
+    },
   }
 
   return {
