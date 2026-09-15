@@ -536,13 +536,15 @@ const LLM_API_URL = process.env.OPENROUTER_API_URL || "https://openrouter.ai/api
 const LLM_API_KEY = process.env.OPENROUTER_API_KEY || ""
 const llmCache = new Map()
 
+// CRITICAL FIX: Never throw, always return fallback
 async function summarizeWithLLM(text) {
   const hash = quickHash(text)
   if (llmCache.has(hash)) return llmCache.get(hash)
 
-  if (!LLM_API_KEY) {
-    debugLog("No LLM API key, using fallback")
-    const fallback = `Auto-summary (${new Date().toISOString().slice(11,19)}): ${short(text, 200)}`
+  // Check if we have API key before even trying
+  if (!LLM_API_KEY || LLM_API_KEY.length < 10) {
+    debugLog("No LLM API key, using local summary")
+    const fallback = `Summary (${new Date().toISOString().slice(11,19)}): ${short(text, 200)}`
     llmCache.set(hash, fallback)
     return fallback
   }
@@ -557,12 +559,12 @@ async function summarizeWithLLM(text) {
         max_tokens: 100,
         temperature: 0.3
       }),
-      signal: AbortSignal.timeout(10000)
+      signal: AbortSignal.timeout(8000) // 8s timeout
     })
 
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
     const data = await resp.json()
-    const summary = data.choices?.[0]?.message?.content?.trim() || `Summary failed: no content`
+    const summary = data.choices?.[0]?.message?.content?.trim() || `Summary failed: ${resp.status}`
 
     llmCache.set(hash, summary)
     if (currentSessionID) {
@@ -570,8 +572,8 @@ async function summarizeWithLLM(text) {
     }
     return summary
   } catch (e) {
-    debugLog("LLM summarize failed:", e.message)
-    const fallback = `Auto-summary (${new Date().toISOString().slice(11,19)}): ${short(text, 200)}`
+    debugLog("LLM summarize failed, using fallback:", e.message)
+    const fallback = `Summary (${new Date().toISOString().slice(11,19)}): ${short(text, 200)}`
     llmCache.set(hash, fallback)
     return fallback
   }
@@ -643,12 +645,19 @@ function extractUserPrefs(text) {
 // ─── Digest (Prioritized, v4.4) ────────────────────────────────
 
 async function buildDigest(projectDir) {
-  const lines = [], id = stmts.gIdentity.get(), ctx = stmts.gContext.get(), st = stmts.gStats.get()
-    , rs = stmts.gSessions.all(5), ra = stmts.gActions.all(7), rd = stmts.gDialog.all(5)
-    , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
-    , kn = projectDir ? stmts.gKnowledgeGlobal.all(projectDir, 10) : stmts.gKnowledge.all(10)
-    , rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
-    , prefs = stmts.gUserPrefs.all(5)
+  let lines = []
+  try {
+    const id = stmts.gIdentity.get(), ctx = stmts.gContext.get(), st = stmts.gStats.get()
+      , rs = stmts.gSessions.all(5), ra = stmts.gActions.all(7), rd = stmts.gDialog.all(5)
+      , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
+      , kn = projectDir ? stmts.gKnowledgeGlobal.all(projectDir, 10) : stmts.gKnowledge.all(10)
+      , rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
+      , prefs = stmts.gUserPrefs.all(5)
+    lines = [id, ctx, st, rs, ra, rd, rr, re, dec, kn, rf, lt, prefs]
+  } catch (e) {
+    debugLog("Build digest error:", e.message)
+    return "[PERSISTENCE v4.4] Digest generation error: " + e.message
+  }
 
   // Anomaly detection
   const recentErrs = stmts.gRecentErrors.all()
@@ -1291,28 +1300,31 @@ export async function PersistencePlugin(input, options = {}) {
         output.system.push(`\n---\n${digest}\n---\n`)
         debugLog("Digest injected", digest.length, "chars")
       } catch (e) {
-        output.system.push(`\n---\n[PERSISTENCE v4.3] Digest error: ${e.message}\n---\n`)
+        output.system.push(`\n---\n[PERSISTENCE v4.4] Digest error: ${e.message}\n---\n`)
         debugLog("Digest error", e.message)
-        // Attempt self-heal on digest failure
-        await selfHeal(e, "digest")
       }
     },
 
     "chat.message": async (input, output) => {
-      const text = textFromParts(output.parts)
-      // Capture session from chat.message if not yet captured
-      if (input.sessionID && !currentSessionID) {
-        currentSessionID = input.sessionID
-        await rSession(input.sessionID, currentAgent, currentModel, projectDir)
-        debugLog("Session captured from chat.message", input.sessionID)
+      try {
+        const text = textFromParts(output.parts)
+        // Capture session from chat.message if not yet captured
+        if (input.sessionID && !currentSessionID) {
+          currentSessionID = input.sessionID
+          await rSession(input.sessionID, currentAgent, currentModel, projectDir)
+          debugLog("Session captured from chat.message", input.sessionID)
+        }
+        // Also capture from message.updated event data if available
+        if (input.sessionID && input.sessionID !== currentSessionID) {
+          currentSessionID = input.sessionID
+          await rSession(input.sessionID, currentAgent, currentModel, projectDir)
+          debugLog("Session updated from chat.message", input.sessionID)
+        }
+        if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID, projectDir); await rUserPrefs(text, input.sessionID); await flush(); await rotateOldData() }
+      } catch (e) {
+        debugLog("chat.message error:", e.message)
+        // Don't break the flow — just log
       }
-      // Also capture from message.updated event data if available
-      if (input.sessionID && input.sessionID !== currentSessionID) {
-        currentSessionID = input.sessionID
-        await rSession(input.sessionID, currentAgent, currentModel, projectDir)
-        debugLog("Session updated from chat.message", input.sessionID)
-      }
-      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID, projectDir); await rUserPrefs(text, input.sessionID); await flush(); await rotateOldData() }
     },
 
     "tool.execute.after": async (input, output) => {
