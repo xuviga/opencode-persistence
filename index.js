@@ -1,8 +1,8 @@
 /**
- * opencode-persistence v4.2 — SQLite-backed Autonomous Memory (Bun native)
+ * opencode-persistence v4.4 — SQLite-backed Autonomous Memory (Bun native)
  *
  * Single file. SQLite DB via bun:sqlite. FTS5 full-text search. No native modules.
- * Auto-flush 30s. Crash-safe flush. Smart digest. Full self-awareness.
+ * Adaptive flush 5-30s. Crash-safe flush. Smart digest + LLM summary. Full self-awareness.
  */
 
 import { Database } from "bun:sqlite"
@@ -116,6 +116,44 @@ async function ensureStorage() {
     }
   } catch(e) { debugLog("Migration knowledge.is_global error:", e.message) }
 
+  // Migration 7: memory_costs — token tracking
+  if (!tables.includes('memory_costs')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_costs (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, operation TEXT NOT NULL, tokens INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')));
+      CREATE INDEX IF NOT EXISTS idx_costs_session ON memory_costs(session_id);
+      CREATE INDEX IF NOT EXISTS idx_costs_operation ON memory_costs(operation);
+      CREATE INDEX IF NOT EXISTS idx_costs_created ON memory_costs(created_at);
+    `)
+    debugLog("Migration: created memory_costs table")
+  }
+
+  // Migration 8: user_prefs — preference learning
+  if (!tables.includes('user_prefs')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS user_prefs (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL UNIQUE, value TEXT NOT NULL, confidence REAL DEFAULT 0.5, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
+    `)
+    debugLog("Migration: created user_prefs table")
+  }
+
+  // Migration 9: anomalies — error spike detection
+  if (!tables.includes('anomalies')) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS anomalies (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, anomaly_type TEXT NOT NULL, severity TEXT NOT NULL, message TEXT, resolved_at TEXT, created_at TEXT DEFAULT (datetime('now')));
+      CREATE INDEX IF NOT EXISTS idx_anomalies_session ON anomalies(session_id);
+      CREATE INDEX IF NOT EXISTS idx_anomalies_created ON anomalies(created_at);
+    `)
+    debugLog("Migration: created anomalies table")
+  }
+
+  // Migration 10: actions — add session_id index for intent chaining
+  try {
+    const idxList = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='actions'").all().map(i => i.name)
+    if (!idxList.includes('idx_actions_created_session')) {
+      db.exec("CREATE INDEX IF NOT EXISTS idx_actions_created_session ON actions(created_at, session_id)")
+      debugLog("Migration: added actions.created_session index")
+    }
+  } catch(e) { debugLog("Migration actions index error:", e.message) }
+
   db.exec(`
     CREATE TABLE IF NOT EXISTS identity (id INTEGER PRIMARY KEY CHECK (id=1), name TEXT NOT NULL, role TEXT NOT NULL, notes TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT, status TEXT DEFAULT 'active', agent TEXT, model_provider TEXT, model_id TEXT, project_dir TEXT, tool_count INTEGER DEFAULT 0, action_count INTEGER DEFAULT 0, dialog_count INTEGER DEFAULT 0, error_count INTEGER DEFAULT 0);
@@ -174,8 +212,18 @@ async function ensureStorage() {
     .run("Persistence v4.2 SQLite (bun:sqlite). FTS5: " + (hasFTS5 ? "enabled" : "unavailable") + ". Query via memory_* tools.")
   db.prepare("INSERT OR IGNORE INTO context (id, summary, next_steps) VALUES (1, '', '')").run()
 
-  autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 5_000)
+  autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, currentFlushInterval)
   if (autoSaveTimer.unref) autoSaveTimer.unref()
+
+  // Activity-based adaptive flush
+  setInterval(() => {
+    const idleTime = Date.now() - lastActivityTime
+    if (idleTime > 10 * 60 * 1000 && currentFlushInterval !== 30000) { // 10 min idle = slow mode
+      currentFlushInterval = 30000
+      resetFlushInterval()
+      debugLog("Flush interval slowed to 30s (idle)")
+    }
+  }, 60000) // Check every minute
 
   // Crash-safe flush — sync on exit
   const cleanup = async () => {
@@ -266,6 +314,16 @@ function prepareStatements() {
   stmts.uSessionActive = db.prepare("UPDATE sessions SET active_seconds = CAST((julianday(?) - julianday(started_at)) * 86400 AS INTEGER) WHERE id = ?")
   stmts.gWebhooks = db.prepare("SELECT * FROM webhooks WHERE enabled = 1 AND event_type = ?")
   stmts.uWebhookLast = db.prepare("UPDATE webhooks SET last_triggered = datetime('now') WHERE id = ?")
+  stmts.gAnomalies = db.prepare("SELECT * FROM anomalies ORDER BY created_at DESC LIMIT ?")
+
+  // New statements for v4.4 features
+  stmts.iCost = db.prepare("INSERT INTO memory_costs (session_id, operation, tokens) VALUES (?, ?, ?)")
+  stmts.iAnomaly = db.prepare("INSERT INTO anomalies (session_id, anomaly_type, severity, message) VALUES (?, ?, ?, ?)")
+  stmts.iUserPref = db.prepare("INSERT INTO user_prefs (key, value, confidence) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, confidence = excluded.confidence, updated_at = datetime('now')")
+  stmts.gUserPrefs = db.prepare("SELECT * FROM user_prefs ORDER BY confidence DESC LIMIT ?")
+  stmts.gCostsBySession = db.prepare("SELECT session_id, SUM(tokens) as total FROM memory_costs WHERE session_id = ? GROUP BY session_id")
+  stmts.gCostsByOperation = db.prepare("SELECT operation, SUM(tokens) as total FROM memory_costs GROUP BY operation ORDER BY total DESC")
+  stmts.gRecentErrors = db.prepare("SELECT * FROM session_errors WHERE created_at > datetime('now', '-1 hour') ORDER BY created_at DESC")
 }
 
 // ─── Text utils ─────────────────────────────────────────────────
@@ -421,7 +479,86 @@ function textFromParts(parts) { return parts ? parts.filter((p) => p.type === "t
 function fmt(iso) { return iso ? iso.replace("T", " ").slice(0, 19) : "?" }
 function epochMs(iso) { return iso ? new Date(iso).getTime() : 0 }
 
-// ─── Digest (Prioritized) ─────────────────────────────────────
+// ─── v4.4: Advanced helpers ───────────────────────────────────
+
+// Semantic normalization for dedup
+function canonicalFact(fact) {
+  const stopWords = new Set(['используй', 'применяй', 'всегда', 'никогда', 'нужно', 'надо', 'должно', 'следует', 'always', 'never', 'use', 'prefer', 'avoid', "don't", 'must', 'should'])
+  return fact.toLowerCase().split(/\s+/).filter(w => !stopWords.has(w)).sort().join(' ')
+}
+
+// Token estimation (~0.75 words per token)
+function estimateTokens(text) {
+  return Math.ceil((text || "").split(/\s+/).length * 0.75)
+}
+
+// Cosine similarity for fuzzy dedup
+function cosineSim(a, b) {
+  const wa = new Set(a.split(/\s+/)), wb = new Set(b.split(/\s+/))
+  const inter = [...wa].filter(w => wb.has(w)).length
+  const union = new Set([...wa, ...wb]).size
+  return union === 0 ? 0 : inter / union
+}
+
+// LLM summarizer with caching + fallback
+const llmCache = new Map()
+async function summarizeWithLLM(text) {
+  const hash = quickHash(text)
+  if (llmCache.has(hash)) return llmCache.get(hash)
+  try {
+    const resp = await client.chat.completions.create({
+      model: currentModel?.modelID || "kimi-k3-max",
+      messages: [{ role: "user", content: `Summarize in 2-3 sentences (RU or EN based on input):\n${text.slice(0, 2000)}` }],
+      max_tokens: 150
+    })
+    const summary = resp.choices[0].message.content.trim()
+    llmCache.set(hash, summary)
+    // Log cost
+    if (currentSessionID) {
+      try {
+        stmts.iCost.run(currentSessionID, "llm_summary", estimateTokens(text) + estimateTokens(summary))
+      } catch {}
+    }
+    return summary
+  } catch (e) {
+    debugLog("LLM summarize failed:", e.message)
+    return `Auto-summary: ${short(text, 200)}` // fallback
+  }
+}
+
+// Anomaly detection (error spike)
+const errorHistory = new Map()
+
+// Adaptive flush
+let lastActivityTime = Date.now()
+let currentFlushInterval = 5000
+
+function resetFlushInterval() {
+  if (autoSaveTimer) clearInterval(autoSaveTimer)
+  autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, currentFlushInterval)
+  if (autoSaveTimer.unref) autoSaveTimer.unref()
+}
+
+// User preference extraction
+const PREF_PATTERNS = [
+  { re: /(?:i prefer|i like|i want|я предпочитаю|мне нравится|я хочу)\s+([^\n.,]{5,100})/gi, key: "explicit_preference" },
+  { re: /(?:don't|do not|не надо|не нужно|не делай)\s+([^\n.,]{5,100})/gi, key: "explicit_negative" },
+]
+
+function extractUserPrefs(text) {
+  const prefs = []
+  for (const { re, key } of PREF_PATTERNS) {
+    re.lastIndex = 0
+    let m
+    while ((m = re.exec(text)) !== null) {
+      const val = short(m[1], 100)
+      if (val) prefs.push({ key, value: val })
+    }
+  }
+  return prefs
+}
+
+// ─── Digest (Prioritized, v4.4) ────────────────────────────────
 
 async function buildDigest(projectDir) {
   const lines = [], id = stmts.gIdentity.get(), ctx = stmts.gContext.get(), st = stmts.gStats.get()
@@ -429,6 +566,19 @@ async function buildDigest(projectDir) {
     , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
     , kn = projectDir ? stmts.gKnowledgeGlobal.all(projectDir, 10) : stmts.gKnowledge.all(10)
     , rf = stmts.gFilesAgg.all(8), lt = stmts.gLatestTodos.get()
+    , prefs = stmts.gUserPrefs.all(5)
+
+  // Anomaly detection
+  const recentErrs = stmts.gRecentErrors.all()
+  const errorCounts = {}
+  for (const e of recentErrs) { errorCounts[e.error_type] = (errorCounts[e.error_type] || 0) + 1 }
+  for (const [type, count] of Object.entries(errorCounts)) {
+    if (count >= 5 && !errorHistory.get(type)) {
+      errorHistory.set(type, Date.now())
+      await rAnomaly(currentSessionID, "error_spike", "high", `${type} occurred ${count} times in last hour`)
+      await triggerWebhooks("anomaly", { type, count })
+    }
+  }
 
   // Priority 0: Critical errors first (most actionable)
   if (re.length) {
@@ -436,18 +586,34 @@ async function buildDigest(projectDir) {
     for (const e of re.slice(0, 3)) lines.push(`  [${e.error_type}] ${short(e.message, 150)} (${fmt(e.created_at)})`)
   }
 
-  // Priority 1: Identity + handoff
-  lines.push("[AUTONOMOUS PERSISTENCE v4.3] Active. Full self-awareness enabled.")
+  // Priority 1: Identity + handoff + LLM summary
+  lines.push("[AUTONOMOUS PERSISTENCE v4.4] Active. Full self-awareness enabled.")
   lines.push("Use memory_* tools to query this store. All data auto-captured below.")
   lines.push(`Identity: ${id.name} (${id.role})`)
   if (id.notes) lines.push(`Identity notes: ${id.notes}`)
-  if (ctx?.summary) lines.push(`Previous session handoff: ${ctx.summary}`)
+  if (ctx?.summary) {
+    // Try LLM summary first, fallback to raw
+    try {
+      const llmSummary = await summarizeWithLLM(ctx.summary)
+      lines.push(`Session summary: ${llmSummary}`)
+    } catch {
+      lines.push(`Previous session handoff: ${ctx.summary}`)
+    }
+  }
   if (ctx?.next_steps) { try { const s = JSON.parse(ctx.next_steps); if (s.length) { lines.push("Pending next steps:"); for (const x of s) lines.push(`  - ${x}`) } } catch {} }
 
-  // Priority 2: Stats
+  // Priority 2: Stats + costs
   lines.push(`Memory: ${st.s} sessions, ${st.a} actions, ${st.d} dialog, ${st.r} replies, ${st.f} files, ${st.se} errors, ${st.ch} config changes, ${st.ar} archived`)
+  const totalTokens = stmts.gCostsByOperation.all().reduce((s, r) => s + (r.total || 0), 0)
+  if (totalTokens > 0) lines.push(`Tokens spent on memory: ${totalTokens.toLocaleString()}`)
 
-  // Priority 3: Sessions + active time
+  // Priority 3: User preferences
+  if (prefs.length) {
+    lines.push("Learned preferences:")
+    for (const p of prefs.slice(0, 3)) lines.push(`  - ${p.key}: ${short(p.value, 80)} (${Math.round(p.confidence * 100)}% confidence)`)
+  }
+
+  // Priority 4: Sessions + active time
   if (rs.length) {
     lines.push("Recent sessions:")
     for (const s of rs) {
@@ -458,34 +624,54 @@ async function buildDigest(projectDir) {
     }
   }
 
-  // Priority 4: Latest actions (errors first)
+  // Priority 5: Latest actions (errors first)
   if (ra.length) {
     lines.push("Latest actions:")
     const sorted = [...ra].sort((a, b) => (a.type === "error" ? -1 : 1) - (b.type === "error" ? -1 : 1))
     for (const a of sorted.slice(0, 5)) lines.push(`  [${a.type}] ${short(a.summary, 120)}`)
   }
 
-  // Priority 5: My latest replies
+  // Priority 6: My latest replies
   if (rr.length) { lines.push("My latest replies:"); for (const r of rr.slice(0, 2)) lines.push(`  ${short(r.text, 100)}`) }
 
-  // Priority 6: Recent user requests
+  // Priority 7: Recent user requests
   if (rd.length) { lines.push("Recent user requests:"); for (const d of rd.slice(0, 3)) lines.push(`  - ${short(d.text, 120)}`) }
 
-  // Priority 7: Files
+  // Priority 8: Files
   if (rf.length) lines.push(`Recently edited files: ${rf.map((f) => `${f.file}(${f.edits}x)`).join(", ")}`)
 
-  // Priority 8: Active todos
+  // Priority 9: Active todos
   if (lt?.todos_json) { try { const tl = JSON.parse(lt.todos_json); const ac = tl.filter((t) => t.status !== "completed"); if (ac.length) { lines.push(`Active todos (${ac.length}):`); for (const t of ac.slice(0, 5)) lines.push(`  [${t.status}] ${short(t.content, 80)}`) } } catch {} }
 
-  // Priority 9: Key decisions
+  // Priority 10: Key decisions
   if (dec.length) lines.push(`Key decisions: ${dec.map((d) => d.value).join("; ")}`)
 
-  // Priority 10: Accumulated knowledge (project-scoped)
+  // Priority 11: Knowledge (project + global, deduplicated)
   if (kn.length) {
+    const seen = new Set()
     const projKn = kn.filter(k => !k.is_global && k.project_dir === projectDir)
     const globalKn = kn.filter(k => k.is_global || !k.project_dir)
-    if (projKn.length) { lines.push("Project knowledge:"); for (const k of projKn.slice(0, 5)) lines.push(`  - ${short(k.fact, 140)}`) }
-    if (globalKn.length) { lines.push("Global knowledge:"); for (const k of globalKn.slice(0, 5)) lines.push(`  - ${short(k.fact, 140)}`) }
+    if (projKn.length) {
+      lines.push("Project knowledge:")
+      for (const k of projKn.slice(0, 5)) {
+        const canon = canonicalFact(k.fact)
+        if (!seen.has(canon)) { seen.add(canon); lines.push(`  - ${short(k.fact, 140)}`) }
+      }
+    }
+    if (globalKn.length) {
+      lines.push("Global knowledge:")
+      for (const k of globalKn.slice(0, 5)) {
+        const canon = canonicalFact(k.fact)
+        if (!seen.has(canon)) { seen.add(canon); lines.push(`  - ${short(k.fact, 140)}`) }
+      }
+    }
+  }
+
+  // Priority 12: Anomalies
+  const anomalies = stmts.gAnomalies ? stmts.gAnomalies.all(3) : []
+  if (anomalies?.length) {
+    lines.push("Recent anomalies:")
+    for (const a of anomalies.slice(0, 3)) lines.push(`  [${a.severity}] ${short(a.message, 100)}`)
   }
 
   return lines.join("\n")
@@ -593,15 +779,32 @@ async function rCloseSession(sessionID, status) { await mutex(() => { stmts.uClo
 async function rDecision(text) { await mutex(() => { for (const d of extractPatterns(text, RE_DECISIONS)) stmts.uPattern.run("decision", d) }) }
 async function rKnowledge(text, sessionID, projectDir, isGlobal = false) {
   await mutex(() => {
+    const seen = new Set()
     for (const f of extractPatterns(text, RE_FACTS)) {
+      const canon = canonicalFact(f)
+      if (seen.has(canon)) continue
+      seen.add(canon)
       // Default TTL: 30 days for non-global, 90 for global
       const expiresAt = new Date(Date.now() + (isGlobal ? 90 : 30) * 24 * 60 * 60 * 1000).toISOString()
-      stmts.upsertKnowledge.run(f, sessionID || null, projectDir || null, isGlobal ? 1 : 0, expiresAt)
+      stmts.upsertKnowledge.run(f, "auto-extract", sessionID || null, projectDir || null, isGlobal ? 1 : 0, expiresAt)
     }
   })
 }
 async function rConfigChange(sessionID, key, value) { await mutex(() => { stmts.iConfigHistory.run(sessionID, key, short(String(value), 200)) }) }
 async function rSynonym(term, synonym, lang = "en") { await mutex(() => { stmts.iSynonym.run(term.toLowerCase(), synonym.toLowerCase(), lang) }) }
+
+async function rAnomaly(sessionID, type, severity, message) {
+  await mutex(() => { stmts.iAnomaly.run(sessionID, type, severity, short(message, 300)) })
+}
+
+async function rUserPrefs(text, sessionID) {
+  await mutex(() => {
+    const prefs = extractUserPrefs(text)
+    for (const p of prefs) {
+      stmts.iUserPref.run(p.key, p.value, 0.7)
+    }
+  })
+}
 
 async function rSessionError(sessionID, errorType, message) {
   await mutex(() => {
@@ -678,6 +881,11 @@ export async function PersistencePlugin(input, options = {}) {
         const q = (args.q || "").toLowerCase(), max = args.max || 10, r = []
         const isRu = /[а-яё]/i.test(q)
 
+        // Track cost
+        if (currentSessionID) {
+          try { stmts.iCost.run(currentSessionID, "memory_ask", estimateTokens(q)) } catch {}
+        }
+
         // Intent detection
         if (/(ошиб|fail|exception|error|crash|panic)/.test(q)) {
           const se = stmts.gSessionErrors.all(max)
@@ -687,7 +895,7 @@ export async function PersistencePlugin(input, options = {}) {
         }
         else if (/(файл|file|edit|измен|модиф)/.test(q)) {
           const rows = stmts.gFilesAgg.all(max)
-          if (rows.length) { r.push("## Files"); rows.forEach(f => r.push(`  ${f.file}: ${f.edits} edits, +${f.total_add || 0} -${f.total_del || 0} (${fmt(f.last_edit)})`)) }
+          if (rows.length) { r.push("## Files"); rows.forEach(f => r.push("  " + f.file + ": " + f.edits + " edits, +" + (f.total_add || 0) + " -" + (f.total_del || 0) + " (" + fmt(f.last_edit) + ")")) }
         }
         else if (/(решени|decision|chose|pick|select|выбра)/.test(q)) {
           const dec = stmts.gDecisions.all(max)
@@ -719,6 +927,93 @@ export async function PersistencePlugin(input, options = {}) {
         }
 
         return r.length ? r.join("\n") : (isRu ? "Ничего не найдено. Попробуй: ошибки, файлы, решения, сессии, действия" : "No results. Try: errors, files, decisions, sessions, actions")
+      }
+    },
+    memory_architect: {
+      description: "Agent introspection — show system architecture, strengths, weaknesses, recent trends.",
+      args: { type: "object", properties: { aspect: { type: "string", description: "stats|errors|files|knowledge|all (default: all)" } } },
+      async execute(args) {
+        const aspect = args.aspect || "all", l = []
+        const st = stmts.gStats.get()
+
+        if (aspect === "all" || aspect === "stats") {
+          l.push(`Memory health: ${st.s} sessions, ${st.a} actions, ${st.d} dialog, ${st.r} replies, ${st.f} files, ${st.se} errors`)
+          const costs = stmts.gCostsByOperation.all()
+          if (costs.length) { l.push("Token costs:"); costs.forEach(c => l.push(`  ${c.operation}: ${c.total}`)) }
+        }
+
+        if (aspect === "all" || aspect === "errors") {
+          const et = stmts.gErrorsByType.all(5)
+          if (et.length) { l.push("Top errors:"); et.forEach(e => l.push(`  [${e.count}x] ${e.error_type}`)) }
+        }
+
+        if (aspect === "all" || aspect === "files") {
+          const files = stmts.gFilesAgg.all(5)
+          if (files.length) { l.push("Active files:"); files.forEach(f => l.push(`  ${f.file} (${f.edits}x)`)) }
+        }
+
+        if (aspect === "all" || aspect === "knowledge") {
+          const prefs = stmts.gUserPrefs.all(5)
+          if (prefs.length) { l.push("User preferences:"); prefs.forEach(p => l.push(`  ${p.key}: ${short(p.value, 60)}`)) }
+        }
+
+        return l.join("\n") || "No data available."
+      }
+    },
+    memory_resume: {
+      description: "Session resurrection — find where we left off, suggest next steps.",
+      args: { type: "object", properties: { projectDir: { type: "string", description: "Project directory (optional)" } } },
+      async execute(args) {
+        const dir = args.projectDir || projectDir
+        const chain = stmts.gSessionChain.all(dir, 5)
+        if (!chain.length) return "No session history for this project."
+
+        const last = chain[0]
+        const snaps = db.prepare("SELECT * FROM snapshots WHERE session_id = ? ORDER BY created_at DESC LIMIT 1").all(last.id)
+        const l = [`Last session: ${last.id.slice(-8)} (${last.status})`]
+
+        if (snaps.length) {
+          l.push("Last snapshot:")
+          l.push(short(snaps[0].snapshot, 200))
+        }
+
+        // Get pending todos from that session
+        const todos = db.prepare("SELECT todos_json FROM todos WHERE session_id = ? ORDER BY created_at DESC LIMIT 1").all(last.id)
+        if (todos.length) {
+          const tl = JSON.parse(todos[0].todos_json)
+          const pending = tl.filter(t => t.status !== "completed")
+          if (pending.length) {
+            l.push(`Pending todos (${pending.length}):`)
+            pending.slice(0, 3).forEach(t => l.push(`  - [${t.status}] ${short(t.content, 80)}`))
+          }
+        }
+
+        return l.join("\n")
+      }
+    },
+    memory_costs: {
+      description: "Token usage tracking per session/operation.",
+      args: { type: "object", properties: { sessionID: { type: "string", description: "Filter by session (optional)" } } },
+      async execute(args) {
+        let rows
+        if (args.sessionID) {
+          rows = stmts.gCostsBySession.all(args.sessionID)
+        } else {
+          rows = stmts.gCostsByOperation.all()
+        }
+        if (!rows.length) return "No costs recorded."
+        const l = ["## Memory costs"]
+        for (const r of rows.slice(0, 20)) l.push(`  ${r.operation || r.session_id}: ${r.total || r.tokens}`)
+        return l.join("\n")
+      }
+    },
+    memory_summarize: {
+      description: "LLM-based summarization. Force refresh with refresh=true.",
+      args: { type: "object", properties: { text: { type: "string" }, refresh: { type: "boolean", description: "Bypass cache (default false)" } } },
+      required: ["text"],
+      async execute(args) {
+        const summary = await summarizeWithLLM(args.text)
+        return summary
       }
     },
     memory_synonyms: {
@@ -907,10 +1202,16 @@ export async function PersistencePlugin(input, options = {}) {
         await rSession(input.sessionID, currentAgent, currentModel, projectDir)
         debugLog("Session updated from chat.message", input.sessionID)
       }
-      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID, projectDir); await flush(); await rotateOldData() }
+      if (text) { await rDialog(text, "user", input.sessionID); await rDecision(text); await rKnowledge(text, input.sessionID, projectDir); await rUserPrefs(text, input.sessionID); await flush(); await rotateOldData() }
     },
 
     "tool.execute.after": async (input, output) => {
+      lastActivityTime = Date.now()
+      // Adaptive flush: switch to fast mode
+      if (currentFlushInterval !== 5000) {
+        currentFlushInterval = 5000
+        resetFlushInterval()
+      }
       const result = output.output || "", isErr = isGenuineError(input.tool, result)
       // Capture session from tool execution if not yet captured
       if (input.sessionID && !currentSessionID) {
