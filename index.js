@@ -379,8 +379,8 @@ async function backupDb() {
     await mkdir(BACKUP_DIR, { recursive: true })
     const stamp = new Date().toISOString().slice(0, 10)
     const dest = path.join(BACKUP_DIR, `memory-${stamp}.db`)
-    const src = Bun.file(DB_PATH)
-    await Bun.write(dest, src)
+    const { copyFile } = await import("fs/promises")
+    await copyFile(DB_PATH, dest)
 
     // Keep last 7 local backups
     const { readdirSync, statSync, unlinkSync } = await import("fs")
@@ -395,7 +395,8 @@ async function backupDb() {
     // S3 upload (optional, if endpoint configured)
     if (S3_ENDPOINT && S3_ENDPOINT !== "http://localhost:9000") {
       try {
-        const fileData = await Bun.file(dest).arrayBuffer()
+        const { readFile } = await import("fs/promises")
+        const fileData = await readFile(dest)
         const s3Url = `${S3_ENDPOINT}/${S3_BUCKET}/memory-${stamp}.db`
 
         await fetch(s3Url, {
