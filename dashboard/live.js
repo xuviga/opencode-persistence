@@ -21,6 +21,9 @@ document.addEventListener('DOMContentLoaded', () => {
     loadStats();
     initControls();
     initInterfaceSelector();
+    initMatrixView();
+    initWaveView();
+    initCloudView();
 
     // Handle window resize
     window.addEventListener('resize', () => {
@@ -316,6 +319,16 @@ function updateGraph(data) {
 
     // Create 3D visualization
     create3DNodes();
+
+    // Update matrix view if it's active
+    if (document.getElementById('matrix-view').classList.contains('active')) {
+        renderMatrixView();
+    }
+
+    // Update cloud view if it's active
+    if (document.getElementById('cloud-view').classList.contains('active')) {
+        renderCloudView();
+    }
 }
 
 // Load statistics
@@ -429,7 +442,173 @@ function initInterfaceSelector() {
                 camera.updateProjectionMatrix();
                 renderer.setSize(document.getElementById('three-container').clientWidth, document.getElementById('three-container').clientHeight);
             }
+
+            // If switching to matrix, re-render it
+            if (interfaceType === 'matrix' && nodes.length > 0) {
+                renderMatrixView();
+            }
+
+            // If switching to wave, start wave animation
+            if (interfaceType === 'wave') {
+                startWaveAnimation();
+            }
+
+            // If switching to cloud, render cloud
+            if (interfaceType === 'cloud') {
+                renderCloudView();
+            }
         });
+    });
+}
+
+// Matrix View Implementation
+function initMatrixView() {
+    // Will be populated when data is available
+}
+
+function renderMatrixView() {
+    const matrixGrid = document.getElementById('matrix-grid');
+    matrixGrid.innerHTML = '';
+
+    // Group nodes by type
+    const nodesByType = {};
+    nodes.forEach(node => {
+        if (!nodesByType[node.type]) {
+            nodesByType[node.type] = [];
+        }
+        nodesByType[node.type].push(node);
+    });
+
+    // Create matrix items
+    for (const type in nodesByType) {
+        const typeHeader = document.createElement('div');
+        typeHeader.className = 'matrix-header';
+        typeHeader.textContent = type.toUpperCase();
+        typeHeader.style.gridColumn = '1 / -1';
+        typeHeader.style.color = getTypeColor(type);
+        typeHeader.style.marginTop = '20px';
+        typeHeader.style.marginBottom = '10px';
+        typeHeader.style.fontSize = '18px';
+        typeHeader.style.fontWeight = 'bold';
+        matrixGrid.appendChild(typeHeader);
+
+        nodesByType[type].forEach(node => {
+            const matrixItem = document.createElement('div');
+            matrixItem.className = 'matrix-item';
+            matrixItem.textContent = node.label;
+            matrixItem.style.borderColor = node.color;
+            matrixItem.style.color = node.color;
+
+            // Add size based on node size
+            const size = Math.max(50, node.size * 5);
+            matrixItem.style.width = `${size}px`;
+            matrixItem.style.height = `${size}px`;
+
+            // Add click event to show details
+            matrixItem.addEventListener('click', () => showNodeDetailsById(node.id));
+
+            matrixGrid.appendChild(matrixItem);
+        });
+    }
+}
+
+function getTypeColor(type) {
+    const colors = {
+        'project': '#00f0ff',
+        'session': '#8866ff',
+        'action': '#ffaa00',
+        'error': '#ff0044',
+        'file': '#ffcc00'
+    };
+    return colors[type] || '#ffffff';
+}
+
+// Wave View Implementation
+let waveAnimationId;
+
+function initWaveView() {
+    const canvas = document.getElementById('wave-canvas');
+    canvas.width = document.getElementById('wave-view').clientWidth;
+    canvas.height = document.getElementById('wave-view').clientHeight;
+}
+
+function startWaveAnimation() {
+    if (waveAnimationId) {
+        cancelAnimationFrame(waveAnimationId);
+    }
+
+    const canvas = document.getElementById('wave-canvas');
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+
+    function drawWave() {
+        ctx.clearRect(0, 0, width, height);
+
+        // Draw wave for each node type
+        const types = ['project', 'session', 'action', 'error', 'file'];
+        const colors = ['#00f0ff', '#8866ff', '#ffaa00', '#ff0044', '#ffcc00'];
+
+        types.forEach((type, index) => {
+            const typeNodes = nodes.filter(n => n.type === type);
+            if (typeNodes.length === 0) return;
+
+            ctx.beginPath();
+            ctx.strokeStyle = colors[index];
+            ctx.lineWidth = 2;
+
+            const amplitude = 20 + typeNodes.length;
+            const frequency = 0.02;
+            const phase = Date.now() * 0.001 + index;
+
+            for (let x = 0; x < width; x += 5) {
+                const y = height / 2 + Math.sin(x * frequency + phase) * amplitude;
+
+                if (x === 0) {
+                    ctx.moveTo(x, y);
+                } else {
+                    ctx.lineTo(x, y);
+                }
+            }
+
+            ctx.stroke();
+        });
+
+        waveAnimationId = requestAnimationFrame(drawWave);
+    }
+
+    drawWave();
+}
+
+// Cloud View Implementation
+function initCloudView() {
+    // Will be populated when data is available
+}
+
+function renderCloudView() {
+    const cloudContainer = document.getElementById('cloud-container');
+    cloudContainer.innerHTML = '';
+
+    // Create word cloud based on node labels
+    nodes.forEach(node => {
+        const cloudItem = document.createElement('div');
+        cloudItem.className = 'cloud-item';
+        cloudItem.textContent = node.label;
+        cloudItem.style.color = node.color;
+
+        // Set size based on node size
+        const size = 12 + node.size;
+        cloudItem.style.fontSize = `${size}px`;
+
+        // Set random position
+        cloudItem.style.position = 'absolute';
+        cloudItem.style.left = `${Math.random() * 80 + 10}%`;
+        cloudItem.style.top = `${Math.random() * 80 + 10}%`;
+
+        // Add click event to show details
+        cloudItem.addEventListener('click', () => showNodeDetailsById(node.id));
+
+        cloudContainer.appendChild(cloudItem);
     });
 }
 
@@ -624,3 +803,40 @@ function highlightConnectedNodes(nodeId) {
 document.addEventListener('DOMContentLoaded', () => {
     document.getElementById('three-container').addEventListener('click', showNodeDetails);
 });
+
+// Show node details by ID (used by other views)
+function showNodeDetailsById(nodeId) {
+    const nodeData = nodes.find(n => n.id === nodeId);
+
+    if (nodeData) {
+        const info = document.getElementById('node-info');
+        let html = `<span class="type-badge ${nodeData.type}">${nodeData.type}</span>`;
+        html += `<h4 style="margin: 8px 0; color: ${nodeData.color}">${nodeData.label}</h4>`;
+
+        const fields = {
+            project: ['path', 'sessions', 'actions'],
+            session: ['id', 'status', 'agent', 'model', 'actions', 'errors', 'duration', 'started'],
+            action: ['tool', 'summary', 'status', 'attempt', 'time'],
+            error: ['message', 'stack', 'time'],
+            file: ['path', 'edits']
+        };
+
+        const labels = {
+            path: 'Path', sessions: 'Sessions', actions: 'Actions',
+            id: 'Session ID', status: 'Status', agent: 'Agent',
+            model: 'Model', errors: 'Errors', duration: 'Duration (s)',
+            started: 'Started', tool: 'Tool', summary: 'Summary',
+            attempt: 'Attempts', time: 'Time', message: 'Message',
+            stack: 'Stack', edits: 'Edit Count'
+        };
+
+        fields[nodeData.type]?.forEach(f => {
+            const val = nodeData[f];
+            if (val !== undefined && val !== null) {
+                html += `<div class="field"><div class="key">${labels[f] || f}</div><div class="val">${String(val).slice(0, 300)}</div></div>`;
+            }
+        });
+
+        info.innerHTML = html;
+    }
+}
