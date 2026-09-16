@@ -28,5 +28,8 @@
     "tool-registry"
   ],
   "license": "MIT",
+  "scripts": {
+    "check-db": "bun db-check.js"
+  },
   "dependencies": {}
 }

@@ -58,6 +58,8 @@ async function ensureStorage() {
     CREATE TABLE IF NOT EXISTS session_errors (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, error_type TEXT NOT NULL, message TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, snapshot TEXT, created_at TEXT DEFAULT (datetime('now')));
     CREATE TABLE IF NOT EXISTS patches (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, message_id TEXT, hash TEXT NOT NULL, files TEXT, created_at TEXT DEFAULT (datetime('now')));
+    CREATE TABLE IF NOT EXISTS memory_context (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, context_type TEXT NOT NULL, content TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')));
+    CREATE INDEX IF NOT EXISTS idx_context_created ON memory_context(created_at);
     CREATE INDEX IF NOT EXISTS idx_actions_type ON actions(type);
     CREATE INDEX IF NOT EXISTS idx_actions_created ON actions(created_at);
     CREATE INDEX IF NOT EXISTS idx_dialog_created ON dialog(created_at);
@@ -127,6 +129,8 @@ function prepareStatements() {
   stmts.gErrorsRange = db.prepare("SELECT * FROM session_errors WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
   stmts.gFilesRange = db.prepare("SELECT * FROM file_changes WHERE created_at BETWEEN ? AND ? ORDER BY created_at DESC LIMIT ?")
   stmts.gStats = db.prepare("SELECT (SELECT COUNT(*) FROM actions) as a, (SELECT COUNT(*) FROM dialog) as d, (SELECT COUNT(*) FROM assistant_replies) as r, (SELECT COUNT(*) FROM sessions) as s, (SELECT COUNT(*) FROM file_changes) as f, (SELECT COUNT(*) FROM knowledge) as k, (SELECT COUNT(*) FROM patterns) as p, (SELECT COUNT(*) FROM session_errors) as se, (SELECT COUNT(*) FROM todos) as t")
+  stmts.gSessionContext = db.prepare("SELECT * FROM memory_context ORDER BY created_at DESC LIMIT ?")
+  stmts.iSessionContext = db.prepare("INSERT INTO memory_context (session_id, context_type, content) VALUES (?, ?, ?)")
 }
 
 // ─── Text utils ─────────────────────────────────────────────────
@@ -357,20 +361,20 @@ export async function PersistencePlugin(input, options = {}) {
           if (rows.length) { r.push("## Actions"); rows.forEach(a => r.push(`  [${a.type}] ${short(a.summary, 120)} (${fmt(a.created_at)})`)) }
         }
         else if (/(meta|decision|reasoning|thought|thinking)/.test(q)) {
-          const rows = stmts.iMeta.all(max)
-          if (rows.length) { r.push("## Meta-cognitive"); rows.forEach(e => r.push(`  [${e.decision}] ${short(e.reasoning, 120)} (${fmt(e.created_at)})`)) }
+          const rows = stmts.gSessionContext.all(max)
+          if (rows.length) { r.push("## Meta-cognitive"); rows.forEach(e => r.push(`  [${e.context_type}] ${short(e.content, 120)} (${fmt(e.created_at)})`)) }
         }
         else if (/(emotion|angry|frustrated|annoyed|happy|sad|чувств|злы|рад)/.test(q)) {
-          const rows = stmts.iUserEmotion.all(max)
-          if (rows.length) { r.push("## Emotions"); rows.forEach(e => r.push(`  [${e.emotion_type}] ${e.intensity} (${short(e.trigger_text, 100)})`)) }
+          const rows = stmts.gSessionContext.all(max).filter(c => c.context_type === 'emotion')
+          if (rows.length) { r.push("## Emotions"); rows.forEach(e => r.push(`  [${e.content}] (${fmt(e.created_at)})`)) }
         }
         else if (/(revision|review|check|assess|self)/.test(q)) {
-          const rows = stmts.iRevision.all(max)
-          if (rows.length) { r.push("## Autonomous revision"); rows.forEach(e => r.push(`  Action #${e.action_count}: ${short(e.assessment, 100)}`)) }
+          const rows = stmts.gSessionContext.all(max).filter(c => c.context_type === 'revision')
+          if (rows.length) { r.push("## Autonomous revision"); rows.forEach(e => r.push(`  ${short(e.content, 120)}`)) }
         }
         else if (/(hidden|connect|link|related|between)/.test(q)) {
-          const rows = stmts.iHidden.all(max)
-          if (rows.length) { r.push("## Hidden connections"); rows.forEach(e => r.push(`  [${e.pattern_type}] ${short(e.pattern_value, 100)} (strength: ${e.strength})`)) }
+          const rows = stmts.gSessionContext.all(max).filter(c => c.context_type === 'connection')
+          if (rows.length) { r.push("## Hidden connections"); rows.forEach(e => r.push(`  ${short(e.content, 120)}`)) }
         }
 
         // Fallback: generic search
