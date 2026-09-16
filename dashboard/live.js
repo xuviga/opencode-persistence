@@ -289,12 +289,16 @@ function resetSelection() {
     simulation.alpha(0.3).restart();
 
     svg.selectAll('.node')
-        .classed('dimmed', false)
-        .classed('highlighted', false);
+        .transition()
+        .duration(300)
+        .style('opacity', 1)
+        .select('.liquid-body')
+        .style('filter', 'url(#glow)');
 
     svg.selectAll('.link')
-        .classed('dimmed', false)
-        .classed('highlighted', false);
+        .transition()
+        .duration(300)
+        .style('opacity', 0.3);
 
     document.getElementById('node-info').innerHTML = '<p class="placeholder">Select a node to view details</p>';
 }
@@ -334,20 +338,22 @@ function hideTooltip() {
 function showNodeDetails(event, d) {
     event.stopPropagation();
 
-    // Если уже выбран этот узел — сброс
+    // Если уже выбран — сброс
     if (selectedNodeId === d.id) {
         resetSelection();
         return;
     }
 
-    selectedNodeId = d.id; // сохраняем id выбранного узла
-
-    // Останавливаем симуляцию и фиксируем все позиции
+    // Полная остановка симуляции
     simulation.stop();
+
+    // Фиксируем позиции ВСЕХ узлов — чтобы не летели
     nodes.forEach(n => {
         n.fx = n.x;
         n.fy = n.y;
     });
+
+    selectedNodeId = d.id;
 
     const info = document.getElementById('node-info');
     let html = `<span class="type-badge ${d.type}">${d.type}</span>`;
@@ -388,13 +394,20 @@ function highlightConnections(d) {
         if (l.target.id === d.id) connectedIds.add(l.source.id);
     });
 
+    // ✅ Не используем классы — просто меняем opacity в JS, НЕ трогая позиции
     svg.selectAll('.node')
-        .classed('dimmed', n => n.id !== d.id && !connectedIds.has(n.id))
-        .classed('highlighted', n => n.id === d.id);
+        .transition()
+        .duration(300)
+        .style('opacity', n => n.id === d.id || connectedIds.has(n.id) ? 1 : 0.15)
+        .select('.liquid-body')
+        .style('filter', n => n.id === d.id || connectedIds.has(n.id)
+            ? 'url(#glow) drop-shadow(0 0 12px currentColor)'
+            : 'url(#glow)');
 
     svg.selectAll('.link')
-        .classed('dimmed', l => l.source.id !== d.id && l.target.id !== d.id)
-        .classed('highlighted', l => l.source.id === d.id || l.target.id === d.id);
+        .transition()
+        .duration(300)
+        .style('opacity', l => l.source.id === d.id || l.target.id === d.id ? 0.7 : 0.05);
 }
 
 function loadStats() {
