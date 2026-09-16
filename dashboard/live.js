@@ -8,9 +8,28 @@ let nodes = [], links = [];
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
+    // Load saved theme
+    const savedTheme = localStorage.getItem('persistence-theme');
+    if (savedTheme === 'cyberpunk') {
+        document.getElementById('theme-stylesheet').disabled = false;
+    }
+
     initGraph();
     connectWebSocket();
     loadStats();
+    initSparkline();
+    initFilters();
+    initMinimap();
+    initControls();
+
+    // Handle window resize
+    window.addEventListener('resize', () => {
+        width = document.getElementById('graph-container').clientWidth;
+        height = document.getElementById('graph-container').clientHeight;
+        simulation.force('center', d3.forceCenter(width / 2, height / 2));
+        simulation.alpha(0.3).restart();
+        updateMinimap();
+    });
 });
 
 function initGraph() {
@@ -122,7 +141,13 @@ function updateGraph(data) {
     nodes = data.nodes;
     links = data.links;
 
+    // Update project filter if projects data available
+    if (data.projects) {
+        updateProjectFilter(data.projects);
+    }
+
     const container = svg.select('.container');
+    // ... rest of the function remains the same ...
 
     // Update links
     let link = container.selectAll('.link')
@@ -169,19 +194,8 @@ function updateGraph(data) {
         .on('mouseout', hideTooltip)
         .on('click', showNodeDetails);
 
-    // Update simulation
-    simulation.nodes(nodes).on('tick', () => {
-        link
-            .attr('x1', d => d.source.x)
-            .attr('y1', d => d.source.y)
-            .attr('x2', d => d.target.x)
-            .attr('y2', d => d.target.y);
-
-        node.attr('transform', d => `translate(${d.x},${d.y})`);
-    });
-
-    simulation.force('link').links(links);
-    simulation.alpha(0.3).restart();
+    // Update simulation with new data
+    updateSimulation();
 }
 
 function getLinkColor(type) {
@@ -356,10 +370,376 @@ function dragended(event, d) {
     d.fy = null;
 }
 
-// Handle resize
-window.addEventListener('resize', () => {
-    width = document.getElementById('graph-container').clientWidth;
-    height = document.getElementById('graph-container').clientHeight;
-    simulation.force('center', d3.forceCenter(width / 2, height / 2));
+// Update minimap after simulation tick
+function updateSimulation() {
+    simulation.nodes(nodes).on('tick', () => {
+        link
+            .attr('x1', d => d.source.x)
+            .attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x)
+            .attr('y2', d => d.target.y);
+
+        node.attr('transform', d => `translate(${d.x},${d.y})`);
+
+        // Update minimap on each tick
+        updateMinimap();
+    });
+
+    simulation.force('link').links(links);
     simulation.alpha(0.3).restart();
-});
+}
+
+// Sparkline functionality
+let sparklineData = [];
+const MAX_SPARKLINE_POINTS = 30;
+
+function initSparkline() {
+    const svg = d3.select('#sparkline');
+    const width = 120;
+    const height = 30;
+
+    // Add gradient
+    const gradient = svg.append('defs')
+        .append('linearGradient')
+        .attr('id', 'sparkGradient')
+        .attr('x1', '0%')
+        .attr('y1', '0%')
+        .attr('x2', '0%')
+        .attr('y2', '100%');
+
+    gradient.append('stop')
+        .attr('offset', '0%')
+        .attr('stop-color', 'var(--neon-green)')
+        .attr('stop-opacity', 0.8);
+
+    gradient.append('stop')
+        .attr('offset', '100%')
+        .attr('stop-color', 'var(--neon-green)')
+        .attr('stop-opacity', 0);
+
+    // Initialize sparkline data
+    for (let i = 0; i < MAX_SPARKLINE_POINTS; i++) {
+        sparklineData.push(0);
+    }
+
+    updateSparkline();
+    setInterval(updateSparklineData, 1000);
+}
+
+function updateSparklineData() {
+    // In a real implementation, this would fetch actual actions data
+    // For now, we'll simulate with random values
+    const newValue = Math.floor(Math.random() * 10);
+    sparklineData.shift();
+    sparklineData.push(newValue);
+    updateSparkline();
+}
+
+function updateSparkline() {
+    const svg = d3.select('#sparkline');
+    const width = 120;
+    const height = 30;
+
+    svg.selectAll('*').remove();
+
+    const x = d3.scaleLinear()
+        .domain([0, sparklineData.length - 1])
+        .range([0, width]);
+
+    const y = d3.scaleLinear()
+        .domain([0, d3.max(sparklineData) || 1])
+        .range([height, 0]);
+
+    const line = d3.line()
+        .x((d, i) => x(i))
+        .y(d => y(d))
+        .curve(d3.curveMonotoneX);
+
+    const area = d3.area()
+        .x((d, i) => x(i))
+        .y0(height)
+        .y1(d => y(d))
+        .curve(d3.curveMonotoneX);
+
+    // Add area
+    svg.append('path')
+        .datum(sparklineData)
+        .attr('class', 'spark-area')
+        .attr('d', area);
+
+    // Add line
+    svg.append('path')
+        .datum(sparklineData)
+        .attr('class', 'spark-line')
+        .attr('d', line);
+
+    // Add dot for last point
+    const lastPoint = sparklineData[sparklineData.length - 1];
+    svg.append('circle')
+        .attr('class', 'spark-dot')
+        .attr('cx', x(sparklineData.length - 1))
+        .attr('cy', y(lastPoint))
+        .attr('r', 3);
+}
+
+// Filters functionality
+let activeFilters = {
+    project: true,
+    session: true,
+    action: true,
+    error: true,
+    file: true
+};
+let selectedProject = '';
+
+function initFilters() {
+    // Type filters
+    document.querySelectorAll('.filter-type').forEach(checkbox => {
+        checkbox.addEventListener('change', (e) => {
+            const type = e.target.dataset.type;
+            activeFilters[type] = e.target.checked;
+            applyFilters();
+        });
+    });
+
+    // Project filter
+    document.getElementById('project-filter').addEventListener('change', (e) => {
+        selectedProject = e.target.value;
+        applyFilters();
+    });
+
+    // Search
+    document.getElementById('search-box').addEventListener('input', (e) => {
+        const term = e.target.value.toLowerCase();
+        searchNodes(term);
+    });
+
+    // Reset button
+    document.getElementById('btn-reset').addEventListener('click', resetView);
+}
+
+function applyFilters() {
+    svg.selectAll('.node')
+        .classed('dimmed', d => !activeFilters[d.type]);
+
+    svg.selectAll('.link')
+        .classed('dimmed', d => {
+            const sourceNode = nodes.find(n => n.id === d.source.id || n.id === d.source);
+            const targetNode = nodes.find(n => n.id === d.target.id || n.id === d.target);
+            return !activeFilters[sourceNode?.type] || !activeFilters[targetNode?.type];
+        });
+
+    // Apply project filter if selected
+    if (selectedProject) {
+        svg.selectAll('.node')
+            .classed('dimmed', d => {
+                if (!activeFilters[d.type]) return true;
+                return d.project !== selectedProject && d.type !== 'project';
+            });
+    }
+}
+
+function updateProjectFilter(projects) {
+    const select = document.getElementById('project-filter');
+    select.innerHTML = '<option value="">All Projects</option>';
+
+    projects.forEach(project => {
+        const option = document.createElement('option');
+        option.value = project.id;
+        option.textContent = project.label;
+        select.appendChild(option);
+    });
+}
+
+function searchNodes(term) {
+    if (!term) {
+        svg.selectAll('.node').classed('search-match', false);
+        return;
+    }
+
+    svg.selectAll('.node')
+        .classed('search-match', d =>
+            d.label.toLowerCase().includes(term) ||
+            (d.path && d.path.toLowerCase().includes(term)) ||
+            (d.id && d.id.toLowerCase().includes(term))
+        );
+}
+
+function resetView() {
+    // Reset zoom
+    svg.transition().duration(750).call(
+        d3.zoom().transform,
+        d3.zoomIdentity
+    );
+
+    // Reset filters
+    document.querySelectorAll('.filter-type').forEach(checkbox => {
+        checkbox.checked = true;
+        const type = checkbox.dataset.type;
+        activeFilters[type] = true;
+    });
+
+    document.getElementById('project-filter').value = '';
+    selectedProject = '';
+
+    document.getElementById('search-box').value = '';
+
+    // Reset node highlighting
+    svg.selectAll('.node')
+        .classed('dimmed', false)
+        .classed('highlighted', false)
+        .classed('search-match', false);
+
+    svg.selectAll('.link')
+        .classed('dimmed', false);
+
+    // Reset info panel
+    document.getElementById('node-info').innerHTML = '<p class="placeholder">Select a node to view details</p>';
+}
+
+// Minimap functionality
+let minimapSvg, minimapWidth, minimapHeight;
+
+function initMinimap() {
+    minimapSvg = d3.select('#minimap');
+    const container = document.getElementById('minimap-container');
+    minimapWidth = container.clientWidth;
+    minimapHeight = container.clientHeight;
+
+    updateMinimap();
+}
+
+function updateMinimap() {
+    if (!minimapSvg || !nodes.length) return;
+
+    minimapSvg.selectAll('*').remove();
+
+    // Calculate bounds of all nodes
+    const xExtent = d3.extent(nodes, d => d.x);
+    const yExtent = d3.extent(nodes, d => d.y);
+
+    // Add some padding
+    const padding = 50;
+    const bounds = {
+        x0: xExtent[0] - padding,
+        y0: yExtent[0] - padding,
+        x1: xExtent[1] + padding,
+        y1: yExtent[1] + padding
+    };
+
+    // Calculate scale to fit nodes in minimap
+    const scale = Math.min(
+        minimapWidth / (bounds.x1 - bounds.x0),
+        minimapHeight / (bounds.y1 - bounds.y0)
+    );
+
+    // Draw nodes on minimap
+    minimapSvg.selectAll('.minimap-node')
+        .data(nodes)
+        .enter()
+        .append('circle')
+        .attr('class', 'minimap-node')
+        .attr('cx', d => (d.x - bounds.x0) * scale)
+        .attr('cy', d => (d.y - bounds.y0) * scale)
+        .attr('r', d => Math.max(1, d.size * scale / 2))
+        .attr('fill', d => d.color)
+        .attr('opacity', 0.7);
+
+    // Draw links on minimap
+    minimapSvg.selectAll('.minimap-link')
+        .data(links)
+        .enter()
+        .append('line')
+        .attr('class', 'minimap-link')
+        .attr('x1', d => (d.source.x - bounds.x0) * scale)
+        .attr('y1', d => (d.source.y - bounds.y0) * scale)
+        .attr('x2', d => (d.target.x - bounds.x0) * scale)
+        .attr('y2', d => (d.target.y - bounds.y0) * scale)
+        .attr('stroke', 'rgba(255, 255, 255, 0.2)')
+        .attr('stroke-width', 0.5);
+
+    // Update viewport indicator
+    updateMinimapViewport(bounds, scale);
+}
+
+function updateMinimapViewport(bounds, scale) {
+    const viewport = document.getElementById('minimap-viewport');
+    const graphContainer = document.getElementById('graph-container');
+
+    // Get current transform of main graph
+    const transform = d3.zoomTransform(svg.node());
+
+    // Calculate viewport dimensions
+    const graphWidth = graphContainer.clientWidth;
+    const graphHeight = graphContainer.clientHeight;
+
+    // Calculate visible area in graph coordinates
+    const visibleX0 = -transform.x / transform.k;
+    const visibleY0 = -transform.y / transform.k;
+    const visibleX1 = visibleX0 + graphWidth / transform.k;
+    const visibleY1 = visibleY0 + graphHeight / transform.k;
+
+    // Convert to minimap coordinates
+    const minimapX0 = (visibleX0 - bounds.x0) * scale;
+    const minimapY0 = (visibleY0 - bounds.y0) * scale;
+    const minimapX1 = (visibleX1 - bounds.x0) * scale;
+    const minimapY1 = (visibleY1 - bounds.y0) * scale;
+
+    // Update viewport indicator
+    viewport.style.left = `${minimapX0}px`;
+    viewport.style.top = `${minimapY0}px`;
+    viewport.style.width = `${minimapX1 - minimapX0}px`;
+    viewport.style.height = `${minimapY1 - minimapY0}px`;
+}
+
+// Controls functionality
+function initControls() {
+    // Export PNG
+    document.getElementById('btn-export-png').addEventListener('click', exportPNG);
+
+    // Export JSON
+    document.getElementById('btn-export-json').addEventListener('click', exportJSON);
+
+    // Toggle theme
+    document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+}
+
+function exportPNG() {
+    // Use html2canvas library that should be included
+    if (typeof html2canvas !== 'undefined') {
+        html2canvas(document.getElementById('graph-container')).then(canvas => {
+            const link = document.createElement('a');
+            link.download = `persistence-graph-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.png`;
+            link.href = canvas.toDataURL('image/png');
+            link.click();
+        });
+    } else {
+        alert('html2canvas library not loaded. Cannot export PNG.');
+    }
+}
+
+function exportJSON() {
+    const data = {
+        nodes: nodes,
+        links: links,
+        timestamp: new Date().toISOString()
+    };
+
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+
+    const link = document.createElement('a');
+    link.download = `persistence-graph-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+    link.href = url;
+    link.click();
+
+    URL.revokeObjectURL(url);
+}
+
+function toggleTheme() {
+    const themeLink = document.getElementById('theme-stylesheet');
+    themeLink.disabled = !themeLink.disabled;
+
+    // Save preference to localStorage
+    localStorage.setItem('persistence-theme', themeLink.disabled ? 'default' : 'cyberpunk');
+}

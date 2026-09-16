@@ -126,12 +126,13 @@ function getStats() {
 }
 
 function getGraphData() {
-  if (!db) return { nodes: [], links: [] }
+  if (!db) return { nodes: [], links: [], projects: [] }
 
   try {
     const nodes = []
     const links = []
     const nodeSet = new Set()
+    const projectsList = []
 
     // Projects
     const projects = db.prepare(`
@@ -152,8 +153,11 @@ function getGraphData() {
         size: Math.min(45, 18 + p.session_count * 4),
         color: "#00f0ff"
       })
+      projectsList.push({ id, label: name, path: p.project_dir })
       nodeSet.add(p.project_dir + "=>" + id)
     })
+
+    // ... rest of the function remains the same ...
 
     // Sessions (recent 60)
     const sessions = db.prepare(`
@@ -252,8 +256,8 @@ function getGraphData() {
       })
     })
 
-    return { nodes, links, timestamp: Date.now() }
+    return { nodes, links, projects: projectsList, timestamp: Date.now() }
   } catch (e) {
-    return { nodes: [], links: [], error: e.message }
+    return { nodes: [], links: [], projects: [], error: e.message }
   }
 }

@@ -11,15 +11,47 @@
     <div id="app">
         <header>
             <h1>XuViGaN <span class="neon">PERSISTENCE</span></h1>
+
+            <!-- Stats Sparkline -->
+            <div id="sparkline-container">
+                <svg id="sparkline" width="120" height="30"></svg>
+                <div class="spark-label">Actions/min</div>
+            </div>
+
             <div id="stats">
                 <div class="stat"><span class="label">Projects</span><span class="value" id="stat-projects">0</span></div>
                 <div class="stat"><span class="label">Sessions</span><span class="value" id="stat-sessions">0</span></div>
                 <div class="stat"><span class="label">Actions</span><span class="value" id="stat-actions">0</span></div>
                 <div class="stat"><span class="label">Errors</span><span class="value" id="stat-errors">0</span></div>
-                <div class="stat"><span class="label">Files</span><span class="value" id="stat-files">0</span></div>
                 <div class="stat live"><span class="pulse"></span> LIVE</div>
             </div>
+
+            <!-- Controls -->
+            <div id="controls">
+                <button id="btn-export-png" title="Export PNG">📸</button>
+                <button id="btn-export-json" title="Export JSON">💾</button>
+                <button id="btn-theme" title="Toggle Theme">🎨</button>
+            </div>
         </header>
+
+        <!-- Filter Bar -->
+        <div id="filter-bar">
+            <input type="text" id="search-box" placeholder="🔍 Search nodes..." />
+
+            <div class="filter-group">
+                <label><input type="checkbox" class="filter-type" data-type="project" checked><span class="badge project">Projects</span></label>
+                <label><input type="checkbox" class="filter-type" data-type="session" checked><span class="badge session">Sessions</span></label>
+                <label><input type="checkbox" class="filter-type" data-type="action" checked><span class="badge action">Actions</span></label>
+                <label><input type="checkbox" class="filter-type" data-type="error" checked><span class="badge error">Errors</span></label>
+                <label><input type="checkbox" class="filter-type" data-type="file" checked><span class="badge file">Files</span></label>
+            </div>
+
+            <select id="project-filter">
+                <option value="">All Projects</option>
+            </select>
+
+            <button id="btn-reset" title="Reset View">⟲</button>
+        </div>
 
         <main>
             <div id="sidebar">
@@ -38,10 +70,20 @@
             <div id="graph-container">
                 <svg id="graph"></svg>
                 <div id="tooltip"></div>
+
+                <!-- Minimap -->
+                <div id="minimap-container">
+                    <svg id="minimap"></svg>
+                    <div id="minimap-viewport"></div>
+                </div>
             </div>
         </main>
     </div>
 
+    <!-- Theme stylesheets (lazy loaded) -->
+    <link id="theme-stylesheet" rel="stylesheet" href="themes/cyberpunk.css" disabled>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="live.js"></script>
 </body>
 </html>

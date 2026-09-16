@@ -1,0 +1,185 @@
+/* Cyberpunk Theme - Alternative color scheme */
+
+:root {
+    --neon-cyan: #00f0ff;
+    --neon-green: #00ff88;
+    --neon-purple: #8866ff;
+    --neon-pink: #ff66aa;
+    --neon-red: #ff0044;
+    --neon-orange: #ffaa00;
+    --neon-yellow: #ffcc00;
+
+    --bg-primary: #050510;
+    --bg-secondary: #0a0a1a;
+    --bg-tertiary: #101025;
+
+    --text-primary: #ffffff;
+    --text-secondary: #ccccdd;
+
+    --border-glow: rgba(0, 240, 255, 0.4);
+}
+
+body {
+    background: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+/* Header */
+header {
+    background: rgba(5, 5, 16, 0.95);
+    border-bottom: 1px solid var(--neon-pink);
+    box-shadow: 0 0 25px rgba(255, 102, 170, 0.3);
+}
+
+h1 .neon {
+    color: var(--neon-pink);
+    text-shadow: 0 0 10px rgba(255, 102, 170, 0.8);
+}
+
+/* Stats */
+.stat {
+    background: rgba(255, 102, 170, 0.05);
+    border: 1px solid rgba(255, 102, 170, 0.2);
+}
+
+.stat .value {
+    color: var(--neon-pink);
+    text-shadow: 0 0 5px rgba(255, 102, 170, 0.7);
+}
+
+/* Controls */
+#controls button {
+    background: rgba(255, 102, 170, 0.1);
+    border: 1px solid var(--neon-pink);
+    color: var(--neon-pink);
+}
+
+#controls button:hover {
+    background: rgba(255, 102, 170, 0.2);
+    box-shadow: 0 0 15px rgba(255, 102, 170, 0.5);
+}
+
+/* Filter bar */
+#filter-bar {
+    background: rgba(5, 5, 16, 0.8);
+    border-bottom: 1px solid rgba(255, 102, 170, 0.2);
+}
+
+#search-box {
+    background: rgba(255, 102, 170, 0.05);
+    border: 1px solid rgba(255, 102, 170, 0.3);
+}
+
+#search-box:focus {
+    border-color: var(--neon-pink);
+    box-shadow: 0 0 15px rgba(255, 102, 170, 0.5);
+}
+
+.badge.project { background: rgba(255, 102, 170, 0.2); color: var(--neon-pink); }
+.badge.session { background: rgba(136, 102, 255, 0.2); color: var(--neon-purple); }
+.badge.action { background: rgba(255, 170, 0, 0.2); color: var(--neon-orange); }
+.badge.error { background: rgba(255, 0, 68, 0.2); color: var(--neon-red); }
+.badge.file { background: rgba(255, 204, 0, 0.2); color: var(--neon-yellow); }
+
+#project-filter {
+    background: rgba(255, 102, 170, 0.1);
+    border: 1px solid rgba(255, 102, 170, 0.3);
+}
+
+#btn-reset {
+    background: rgba(255, 102, 170, 0.1);
+    border: 1px solid var(--neon-pink);
+    color: var(--neon-pink);
+}
+
+#btn-reset:hover {
+    background: rgba(255, 102, 170, 0.2);
+    box-shadow: 0 0 15px rgba(255, 102, 170, 0.5);
+}
+
+/* Sidebar */
+#sidebar {
+    background: rgba(5, 5, 16, 0.9);
+    border-right: 1px solid rgba(255, 102, 170, 0.2);
+}
+
+.panel h3 {
+    color: var(--neon-pink);
+    border-bottom: 1px solid rgba(255, 102, 170, 0.3);
+}
+
+.event-item {
+    background: rgba(255, 102, 170, 0.05);
+    border-left: 3px solid var(--neon-pink);
+}
+
+.event-item.session { border-left-color: var(--neon-purple); }
+.event-item.action { border-left-color: var(--neon-orange); }
+.event-item.error { border-left-color: var(--neon-red); }
+
+/* Graph */
+#graph-container {
+    background: var(--bg-primary);
+}
+
+.node circle {
+    filter: drop-shadow(0 0 8px currentColor);
+}
+
+.link {
+    stroke: rgba(255, 102, 170, 0.2);
+}
+
+.link.highlighted {
+    stroke: var(--neon-pink);
+    stroke-width: 2px;
+}
+
+/* Tooltip */
+#tooltip {
+    background: rgba(5, 5, 16, 0.95);
+    border: 1px solid var(--neon-pink);
+    box-shadow: 0 0 15px rgba(255, 102, 170, 0.4);
+}
+
+.tooltip-title {
+    color: var(--neon-pink);
+}
+
+/* Minimap */
+#minimap-container {
+    background: rgba(5, 5, 16, 0.9);
+    border: 1px solid var(--neon-pink);
+    box-shadow: 0 0 20px rgba(255, 102, 170, 0.3);
+}
+
+#minimap-viewport {
+    border: 2px solid var(--neon-pink);
+    background: rgba(255, 102, 170, 0.1);
+}
+
+/* Sparkline */
+#sparkline-container {
+    background: rgba(255, 102, 170, 0.05);
+    border: 1px solid rgba(255, 102, 170, 0.2);
+}
+
+.spark-line {
+    stroke: var(--neon-pink);
+    filter: drop-shadow(0 1px 3px rgba(255, 102, 170, 0.5));
+}
+
+.spark-dot {
+    fill: var(--neon-pink);
+    filter: drop-shadow(0 0 5px var(--neon-pink));
+}
+
+/* Node info panel */
+#node-info .type-badge {
+    background: rgba(255, 102, 170, 0.2);
+    color: var(--neon-pink);
+}
+
+#node-info .field .key {
+    color: var(--neon-pink);
+}
