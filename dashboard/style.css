@@ -299,11 +299,6 @@ main {
 
 .node {
     cursor: pointer;
-    transition: transform 0.4s cubic-bezier(0.34, 1.56, 0.64, 1);
-}
-
-.node:hover {
-    transform: scale(1.15);
 }
 
 /* Внешнее свечение — "жидкая" аура */
@@ -313,11 +308,17 @@ main {
     stroke-opacity: 0.2;
     filter: blur(6px);
     animation: aura-pulse 3s ease-in-out infinite;
+    transition: all 0.3s ease;
+}
+
+.node:hover .aura {
+    stroke-opacity: 0.4;
+    filter: blur(10px);
 }
 
 @keyframes aura-pulse {
-    0%, 100% { stroke-opacity: 0.15; r: attr(data-size); }
-    50% { stroke-opacity: 0.35; r: calc(attr(data-size) * 1.2); }
+    0%, 100% { stroke-opacity: 0.15; }
+    50% { stroke-opacity: 0.35; }
 }
 
 /* Основное тело — капля */
@@ -326,12 +327,14 @@ main {
     stroke-width: 2;
     stroke-opacity: 0.9;
     filter: url(#glow);
-    transition: all 0.3s;
+    transition: all 0.2s ease;
 }
 
 .node:hover .liquid-body {
-    filter: url(#glow) drop-shadow(0 0 15px currentColor);
     stroke: #ffffff;
+    stroke-width: 3;
+    stroke-opacity: 1;
+    filter: url(#glow) drop-shadow(0 0 12px currentColor);
 }
 
 /* Ядро — "плавающий" блик */
