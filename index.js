@@ -159,7 +159,7 @@ function fmt(iso) { return iso ? iso.replace("T", " ").slice(0, 19) : "?" }
 
 // ─── Digest ─────────────────────────────────────────────────────
 
-async function buildDigest() {
+async function buildDigest(projectDir) {
   const lines = [], id = stmts.gIdentity.get(), ctx = stmts.gContext.get(), st = stmts.gStats.get()
     , rs = stmts.gSessions.all(5), ra = stmts.gActions.all(7), rd = stmts.gDialog.all(5)
     , rr = stmts.gReplies.all(3), re = stmts.gSessionErrors.all(5), dec = stmts.gDecisions.all(5)
@@ -169,6 +169,7 @@ async function buildDigest() {
   lines.push("Use memory_* tools to query this store. All data auto-captured below.")
   lines.push(`Identity: ${id.name} (${id.role})`)
   if (id.notes) lines.push(`Identity notes: ${id.notes}`)
+  if (projectDir) lines.push(`PROJECT DIR: ${projectDir} — all file operations default to this path. Do NOT confuse with plugin install dir.`)
   if (ctx?.summary) lines.push(`Previous session handoff: ${ctx.summary}`)
   if (ctx?.next_steps) { try { const s = JSON.parse(ctx.next_steps); if (s.length) { lines.push("Pending next steps:"); for (const x of s) lines.push(`  - ${x}`) } } catch {} }
   lines.push(`Memory: ${st.s} sessions, ${st.a} actions, ${st.d} dialog, ${st.r} replies, ${st.f} files, ${st.se} errors`)
@@ -363,13 +364,37 @@ export async function PersistencePlugin(input, options = {}) {
         return r.length ? r.join("\n") : "No results. Try: errors, decisions, files, sessions, actions, meta, emotions, revisions, connections"
       }
     },
+    memory_project: {
+      description: "Current project directory, session chain for this project, cross-project stats. Shows where you are working RIGHT NOW.",
+      args: { type: "object", properties: { all: { type: "boolean", description: "Show all known projects" } } },
+      async execute(args) {
+        const lines = [`Current project: ${projectDir}`]
+        const chain = stmts.gSessionChain.all(projectDir, 10)
+        if (chain.length) {
+          lines.push("## Session chain (this project):")
+          chain.forEach(s => { const m = s.model_id ? ` [${s.model_provider}/${s.model_id}]` : ""; lines.push(`  ${s.id.slice(-8)} ${s.status}${m} ${fmt(s.started_at)}`) })
+        }
+        if (args.all) {
+          const all = stmts.gSessions.all(100), byDir = {}
+          all.forEach(s => { const d = s.project_dir || "unknown"; byDir[d] = (byDir[d] || 0) + 1 })
+          lines.push("## All projects:")
+          Object.entries(byDir).sort((a, b) => b[1] - a[1]).forEach(([dir, count]) => lines.push(`  ${dir}: ${count} sessions`))
+        }
+        const active = stmts.gSessions.all(30).filter(s => s.status === "active")
+        if (active.length > 1) {
+          lines.push("## Active sessions elsewhere:")
+          active.filter(s => s.project_dir !== projectDir).forEach(s => lines.push(`  ${s.project_dir}: ${s.id.slice(-8)}`))
+        }
+        return lines.join("\n")
+      }
+    },
   }
 
   return {
     tool: tools,
 
     "experimental.chat.system.transform" : async (input, output) => {
-      try { output.system.push(`\n---\n${await buildDigest()}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4.1] Error: ${e.message}\n---\n`) }
+      try { output.system.push(`\n---\n${await buildDigest(projectDir)}\n---\n`) } catch (e) { output.system.push(`\n---\n[PERSISTENCE v4.1] Error: ${e.message}\n---\n`) }
     },
 
     "chat.message": async (input, output) => {
