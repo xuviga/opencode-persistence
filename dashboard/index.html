@@ -4,26 +4,51 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>XuViGaN Persistence Dashboard</title>
-    <script src="https://d3js.org/d3.v7.min.js"></script>
     <link rel="stylesheet" href="style.css">
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 </head>
 <body>
     <div id="app">
         <header>
-            <h1>XuViGaN <span class="neon">PERSISTENCE</span></h1>
-
-            <!-- Stats Sparkline -->
-            <div id="sparkline-container">
-                <svg id="sparkline" width="120" height="30"></svg>
-                <div class="spark-label">Actions/min</div>
+            <div class="logo-container">
+                <div class="logo-cube"></div>
+                <h1>XuViGaN <span class="neon">PERSISTENCE</span></h1>
             </div>
 
-            <div id="stats">
-                <div class="stat"><span class="label">Projects</span><span class="value" id="stat-projects">0</span></div>
-                <div class="stat"><span class="label">Sessions</span><span class="value" id="stat-sessions">0</span></div>
-                <div class="stat"><span class="label">Actions</span><span class="value" id="stat-actions">0</span></div>
-                <div class="stat"><span class="label">Errors</span><span class="value" id="stat-errors">0</span></div>
-                <div class="stat live"><span class="pulse"></span> LIVE</div>
+            <div class="header-center">
+                <!-- 3D Data Visualization -->
+                <div id="data-cube-container">
+                    <div class="cube-face front">Projects</div>
+                    <div class="cube-face back">Sessions</div>
+                    <div class="cube-face right">Actions</div>
+                    <div class="cube-face left">Errors</div>
+                    <div class="cube-face top">Files</div>
+                    <div class="cube-face bottom">Live</div>
+                </div>
+
+                <div id="hologram-stats">
+                    <div class="holo-stat">
+                        <div class="holo-value" id="stat-projects">0</div>
+                        <div class="holo-label">Projects</div>
+                    </div>
+                    <div class="holo-stat">
+                        <div class="holo-value" id="stat-sessions">0</div>
+                        <div class="holo-label">Sessions</div>
+                    </div>
+                    <div class="holo-stat">
+                        <div class="holo-value" id="stat-actions">0</div>
+                        <div class="holo-label">Actions</div>
+                    </div>
+                    <div class="holo-stat">
+                        <div class="holo-value" id="stat-errors">0</div>
+                        <div class="holo-label">Errors</div>
+                    </div>
+                    <div class="holo-stat live">
+                        <div class="holo-pulse"></div>
+                        <div class="holo-label">LIVE</div>
+                    </div>
+                </div>
             </div>
 
             <!-- Controls -->
@@ -34,48 +59,62 @@
             </div>
         </header>
 
-        <!-- Filter Bar -->
-        <div id="filter-bar">
-            <input type="text" id="search-box" placeholder="🔍 Search nodes..." />
-
-            <div class="filter-group">
-                <label><input type="checkbox" class="filter-type" data-type="project" checked><span class="badge project">Projects</span></label>
-                <label><input type="checkbox" class="filter-type" data-type="session" checked><span class="badge session">Sessions</span></label>
-                <label><input type="checkbox" class="filter-type" data-type="action" checked><span class="badge action">Actions</span></label>
-                <label><input type="checkbox" class="filter-type" data-type="error" checked><span class="badge error">Errors</span></label>
-                <label><input type="checkbox" class="filter-type" data-type="file" checked><span class="badge file">Files</span></label>
+        <!-- Adaptive Interface - changes based on data -->
+        <div id="adaptive-interface">
+            <div id="interface-selector">
+                <button class="interface-btn active" data-interface="graph">3D Graph</button>
+                <button class="interface-btn" data-interface="matrix">Matrix</button>
+                <button class="interface-btn" data-interface="wave">Wave</button>
+                <button class="interface-btn" data-interface="cloud">Cloud</button>
             </div>
 
-            <select id="project-filter">
-                <option value="">All Projects</option>
-            </select>
-
-            <button id="btn-reset" title="Reset View">⟲</button>
+            <div id="search-container">
+                <input type="text" id="search-box" placeholder="🔍 Search nodes..." />
+                <button id="btn-reset" title="Reset View">⟲</button>
+            </div>
         </div>
 
         <main>
-            <div id="sidebar">
-                <div class="panel">
-                    <h3>Node Details</h3>
-                    <div id="node-info">
-                        <p class="hint">Click a node to inspect</p>
+            <div id="visualization-container">
+                <!-- 3D Graph View -->
+                <div id="graph-view" class="visualization active">
+                    <div id="three-container"></div>
+                    <div id="graph-overlay"></div>
+                    <div id="tooltip"></div>
+
+                    <!-- Minimap -->
+                    <div id="minimap-container">
+                        <svg id="minimap"></svg>
+                        <div id="minimap-viewport"></div>
                     </div>
                 </div>
+
+                <!-- Matrix View -->
+                <div id="matrix-view" class="visualization">
+                    <div id="matrix-grid"></div>
+                </div>
+
+                <!-- Wave View -->
+                <div id="wave-view" class="visualization">
+                    <canvas id="wave-canvas"></canvas>
+                </div>
+
+                <!-- Cloud View -->
+                <div id="cloud-view" class="visualization">
+                    <div id="cloud-container"></div>
+                </div>
+            </div>
+
+            <div id="sidebar">
                 <div class="panel">
                     <h3>Live Events</h3>
                     <div id="events-feed"></div>
                 </div>
-            </div>
-
-            <div id="graph-container">
-                <canvas id="particles"></canvas>
-                <svg id="graph"></svg>
-                <div id="tooltip"></div>
-
-                <!-- Minimap -->
-                <div id="minimap-container">
-                    <svg id="minimap"></svg>
-                    <div id="minimap-viewport"></div>
+                <div class="panel">
+                    <h3>Node Info</h3>
+                    <div id="node-info">
+                        <p class="placeholder">Select a node to view details</p>
+                    </div>
                 </div>
             </div>
         </main>

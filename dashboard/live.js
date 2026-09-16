@@ -1,105 +1,275 @@
-// XuViGaN Persistence Dashboard - Live Graph
+// XuViGaN Persistence Dashboard - Spatial Data Visualization
+// Using Three.js for 3D visualization instead of traditional D3 graph
 
 const WS_URL = `ws://${window.location.hostname}:${window.location.port}/ws`;
 let ws = null;
-let simulation = null;
-let svg, width, height;
+let scene, camera, renderer, controls;
 let nodes = [], links = [];
+let threeNodes = new Map(); // Map for 3D nodes
+let threeLinks = []; // Array for 3D links
 
 // Initialize
-    document.addEventListener('DOMContentLoaded', () => {
-        // Load saved theme
-        const savedTheme = localStorage.getItem('persistence-theme');
-        if (savedTheme === 'cyberpunk') {
-            document.getElementById('theme-stylesheet').disabled = false;
-        }
+document.addEventListener('DOMContentLoaded', () => {
+    // Load saved theme
+    const savedTheme = localStorage.getItem('persistence-theme');
+    if (savedTheme === 'cyberpunk') {
+        document.getElementById('theme-stylesheet').disabled = false;
+    }
 
-        initGraph();
-        connectWebSocket();
-        loadStats();
-        initSparkline();
-        initFilters();
-        initMinimap();
-        initControls();
-        initParticles();
+    initThreeJS();
+    connectWebSocket();
+    loadStats();
+    initControls();
+    initInterfaceSelector();
 
-        // Handle window resize
-        window.addEventListener('resize', () => {
-            width = document.getElementById('graph-container').clientWidth;
-            height = document.getElementById('graph-container').clientHeight;
-            simulation.force('center', d3.forceCenter(width / 2, height / 2));
-            simulation.alpha(0.3).restart();
-            updateMinimap();
-            resizeParticles();
-        });
+    // Handle window resize
+    window.addEventListener('resize', () => {
+        camera.aspect = document.getElementById('three-container').clientWidth / document.getElementById('three-container').clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(document.getElementById('three-container').clientWidth, document.getElementById('three-container').clientHeight);
+    });
+});
+
+// Three.js initialization for 3D visualization
+function initThreeJS() {
+    const container = document.getElementById('three-container');
+    const width = container.clientWidth;
+    const height = container.clientHeight;
+
+    // Create scene
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0a0a12);
+    scene.fog = new THREE.FogExp2(0x0a0a12, 0.05);
+
+    // Create camera
+    camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+    camera.position.z = 50;
+
+    // Create renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    container.appendChild(renderer.domElement);
+
+    // Add ambient light
+    const ambientLight = new THREE.AmbientLight(0x404040, 2);
+    scene.add(ambientLight);
+
+    // Add directional light
+    const directionalLight = new THREE.DirectionalLight(0x00f0ff, 1);
+    directionalLight.position.set(1, 1, 1);
+    scene.add(directionalLight);
+
+    // Add point lights for each color
+    const colors = [0x00f0ff, 0x00ff88, 0x8866ff, 0xff3366, 0xffaa00];
+    colors.forEach((color, i) => {
+        const light = new THREE.PointLight(color, 1, 100);
+        light.position.set(
+            Math.cos(i * Math.PI * 2 / colors.length) * 30,
+            Math.sin(i * Math.PI * 2 / colors.length) * 30,
+            0
+        );
+        scene.add(light);
     });
 
-function initGraph() {
-    svg = d3.select('#graph');
-    width = document.getElementById('graph-container').clientWidth;
-    height = document.getElementById('graph-container').clientHeight;
+    // Add particles background
+    createParticleBackground();
 
-    // Add defs for glow effects
-    const defs = svg.append('defs');
+    // Add controls
+    controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.05;
+    controls.screenSpacePanning = false;
+    controls.minDistance = 10;
+    controls.maxDistance = 200;
 
-    const filter = defs.append('filter')
-        .attr('id', 'glow')
-        .attr('x', '-50%')
-        .attr('y', '-50%')
-        .attr('width', '200%')
-        .attr('height', '200%');
-
-    filter.append('feGaussianBlur')
-        .attr('stdDeviation', '3')
-        .attr('result', 'coloredBlur');
-
-    const feMerge = filter.append('feMerge');
-    feMerge.append('feMergeNode').attr('in', 'coloredBlur');
-    feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
-
-    // Zoom behavior
-    const zoom = d3.zoom()
-        .scaleExtent([0.1, 4])
-        .on('zoom', (event) => {
-            container.attr('transform', event.transform);
-        });
-
-    svg.call(zoom);
-
-    const container = svg.append('g').attr('class', 'container');
-
-    // Arrow marker for links
-    defs.append('marker')
-        .attr('id', 'arrowhead')
-        .attr('viewBox', '-0 -5 10 10')
-        .attr('refX', 20)
-        .attr('refY', 0)
-        .attr('orient', 'auto')
-        .attr('markerWidth', 6)
-        .attr('markerHeight', 6)
-        .append('path')
-        .attr('d', 'M 0,-5 L 10,0 L 0,5')
-        .attr('fill', 'rgba(0,240,255,0.3)');
-
-    // Initialize force simulation
-    simulation = d3.forceSimulation()
-        .force('link', d3.forceLink().id(d => d.id).distance(d => {
-            if (d.type === 'contains') return 80;
-            if (d.type === 'executes') return 40;
-            if (d.type === 'modifies') return 60;
-            return 50;
-        }))
-        .force('charge', d3.forceManyBody().strength(d => {
-            if (d.type === 'project') return -400;
-            if (d.type === 'session') return -200;
-            return -50;
-        }))
-        .force('center', d3.forceCenter(width / 2, height / 2))
-        .force('collision', d3.forceCollide().radius(d => d.size + 5))
-        .force('x', d3.forceX(width / 2).strength(0.05))
-        .force('y', d3.forceY(height / 2).strength(0.05));
+    // Animation loop
+    animate();
 }
 
+// Create particle background
+function createParticleBackground() {
+    const particleCount = 1000;
+    const particles = new THREE.BufferGeometry();
+    const positions = new Float32Array(particleCount * 3);
+    const colors = new Float32Array(particleCount * 3);
+
+    for (let i = 0; i < particleCount; i++) {
+        const i3 = i * 3;
+
+        // Positions
+        positions[i3] = (Math.random() - 0.5) * 200;
+        positions[i3 + 1] = (Math.random() - 0.5) * 200;
+        positions[i3 + 2] = (Math.random() - 0.5) * 200;
+
+        // Colors
+        colors[i3] = 0;     // R
+        colors[i3 + 1] = 0.9; // G
+        colors[i3 + 2] = 1;   // B
+    }
+
+    particles.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    particles.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+    const particleMaterial = new THREE.PointsMaterial({
+        size: 1.5,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.7
+    });
+
+    const particleSystem = new THREE.Points(particles, particleMaterial);
+    scene.add(particleSystem);
+}
+
+// Animation loop
+function animate() {
+    requestAnimationFrame(animate);
+
+    // Update controls
+    controls.update();
+
+    // Rotate data cube
+    const cube = document.querySelector('.logo-cube');
+    if (cube) {
+        cube.style.transform = `rotateX(${Date.now() * 0.01}deg) rotateY(${Date.now() * 0.015}deg)`;
+    }
+
+    // Animate nodes if they exist
+    threeNodes.forEach((node3d, id) => {
+        // Find corresponding data node
+        const nodeData = nodes.find(n => n.id === id);
+        if (nodeData) {
+            // Pulse animation
+            const scale = 1 + Math.sin(Date.now() * 0.002 + parseInt(id.replace(/\D/g, ''))) * 0.1;
+            node3d.scale.set(scale, scale, scale);
+
+            // Rotate for type-specific animations
+            if (nodeData.type === 'project') {
+                node3d.rotation.y += 0.002;
+            } else if (nodeData.type === 'session') {
+                node3d.rotation.x += 0.003;
+            }
+        }
+    });
+
+    renderer.render(scene, camera);
+}
+
+// Create 3D nodes from data
+function create3DNodes() {
+    // Clear existing nodes
+    threeNodes.forEach((node3d, id) => {
+        scene.remove(node3d);
+    });
+    threeNodes.clear();
+
+    // Clear existing links
+    threeLinks.forEach(link => {
+        scene.remove(link);
+    });
+    threeLinks = [];
+
+    // Create nodes
+    nodes.forEach(node => {
+        let geometry, material, mesh;
+
+        // Create different geometry based on node type
+        switch (node.type) {
+            case 'project':
+                // Create a complex icosahedron for projects
+                geometry = new THREE.IcosahedronGeometry(node.size / 10, 1);
+                break;
+            case 'session':
+                // Create a torus knot for sessions
+                geometry = new THREE.TorusKnotGeometry(node.size / 15, node.size / 30, 100, 16);
+                break;
+            case 'error':
+                // Create a sharp octahedron for errors
+                geometry = new THREE.OctahedronGeometry(node.size / 8, 1);
+                break;
+            case 'file':
+                // Create a custom shape for files
+                geometry = new THREE.BoxGeometry(node.size / 10, node.size / 10, node.size / 10);
+                break;
+            default:
+                // Default sphere for actions
+                geometry = new THREE.SphereGeometry(node.size / 10, 16, 16);
+        }
+
+        // Create material with glow effect
+        material = new THREE.MeshPhongMaterial({
+            color: node.color.replace('#', '0x'),
+            emissive: node.color.replace('#', '0x'),
+            emissiveIntensity: 0.5,
+            transparent: true,
+            opacity: 0.9,
+            specular: 0xffffff,
+            shininess: 30
+        });
+
+        // Create mesh
+        mesh = new THREE.Mesh(geometry, material);
+
+        // Position randomly in 3D space
+        mesh.position.x = (Math.random() - 0.5) * 80;
+        mesh.position.y = (Math.random() - 0.5) * 80;
+        mesh.position.z = (Math.random() - 0.5) * 80;
+
+        // Store reference
+        mesh.userData = { id: node.id, type: node.type };
+
+        // Add to scene and map
+        scene.add(mesh);
+        threeNodes.set(node.id, mesh);
+    });
+
+    // Create links between nodes
+    links.forEach(link => {
+        const sourceNode = threeNodes.get(link.source.id || link.source);
+        const targetNode = threeNodes.get(link.target.id || link.target);
+
+        if (sourceNode && targetNode) {
+            // Create a curve for the link
+            const curve = new THREE.QuadraticBezierCurve3(
+                sourceNode.position,
+                new THREE.Vector3(
+                    (sourceNode.position.x + targetNode.position.x) / 2,
+                    (sourceNode.position.y + targetNode.position.y) / 2,
+                    (sourceNode.position.z + targetNode.position.z) / 2 + 10 // Curve upward
+                ),
+                targetNode.position
+            );
+
+            // Create tube geometry for the link
+            const geometry = new THREE.TubeGeometry(curve, 20, 0.2, 8, false);
+            const material = new THREE.MeshPhongMaterial({
+                color: getLinkColor(link.type).replace('#', '0x'),
+                transparent: true,
+                opacity: 0.4,
+                emissive: getLinkColor(link.type).replace('#', '0x'),
+                emissiveIntensity: 0.3
+            });
+
+            const linkMesh = new THREE.Mesh(geometry, material);
+            scene.add(linkMesh);
+            threeLinks.push(linkMesh);
+        }
+    });
+}
+
+// Get color for link based on type
+function getLinkColor(type) {
+    const colors = {
+        'contains': '#00f0ff',
+        'executes': '#ffaa00',
+        'modifies': '#ffcc00',
+        'threw': '#ff0044'
+    };
+    return colors[type] || '#ffffff';
+}
+
+// WebSocket connection
 function connectWebSocket() {
     ws = new WebSocket(WS_URL);
 
@@ -137,213 +307,18 @@ function connectWebSocket() {
     };
 }
 
+// Update graph data
 function updateGraph(data) {
     if (!data || !data.nodes) return;
 
     nodes = data.nodes;
     links = data.links;
 
-    // Update project filter if projects data available
-    if (data.projects) {
-        updateProjectFilter(data.projects);
-    }
-
-    const container = svg.select('.container');
-    // ... rest of the function remains the same ...
-
-    // Update links
-    let link = container.selectAll('.link')
-        .data(links, d => `${d.source.id || d.source}-${d.target.id || d.target}`);
-
-    link.exit().remove();
-
-    link = link.enter().append('line')
-        .attr('class', 'link')
-        .attr('stroke', d => getLinkColor(d.type))
-        .attr('stroke-width', 1)
-        .attr('marker-end', 'url(#arrowhead)')
-        .merge(link);
-
-    // Update nodes
-    let node = container.selectAll('.node')
-        .data(nodes, d => d.id);
-
-    node.exit().remove();
-
-    const nodeEnter = node.enter().append('g')
-        .attr('class', 'node')
-        .call(d3.drag()
-            .on('start', dragstarted)
-            .on('drag', dragged)
-            .on('end', dragended));
-
-    // Create neural network style nodes
-    nodeEnter.each(function(d) {
-        const g = d3.select(this);
-
-        // Create neural aura
-        g.append('circle')
-            .attr('r', d => d.size * 2)
-            .attr('fill', 'none')
-            .attr('stroke', d => d.color)
-            .attr('stroke-width', 0.5)
-            .attr('opacity', 0.1)
-            .attr('filter', 'url(#glow)')
-            .attr('class', 'neural-aura');
-
-        // Create neural connections (dendrites)
-        if (d.type === 'project' || d.type === 'session') {
-            const dendriteCount = d.type === 'project' ? 8 : 5;
-            for (let i = 0; i < dendriteCount; i++) {
-                const angle = (Math.PI * 2 / dendriteCount) * i;
-                const length = d.size * 0.7;
-                const x2 = Math.cos(angle) * length;
-                const y2 = Math.sin(angle) * length;
-
-                g.append('path')
-                    .attr('d', `M 0 0 Q ${x2 * 0.5} ${y2 * 0.5 + (Math.random() * 10 - 5)} ${x2} ${y2}`)
-                    .attr('stroke', d.color)
-                    .attr('stroke-width', 1)
-                    .attr('opacity', 0.4)
-                    .attr('fill', 'none')
-                    .attr('class', 'neural-dendrite');
-            }
-        }
-
-        // Create main node body with morphing shape
-        const morphPath = getMorphPath(d.type, d.size);
-        g.append('path')
-            .attr('d', morphPath)
-            .attr('fill', d => d.color)
-            .attr('stroke', '#fff')
-            .attr('stroke-width', 1.5)
-            .attr('opacity', 0.9)
-            .attr('class', 'neural-body')
-            .attr('filter', 'url(#glow)');
-
-        // Add inner nucleus
-        if (d.type === 'project' || d.type === 'session') {
-            g.append('circle')
-                .attr('r', d => d.size * 0.3)
-                .attr('fill', 'rgba(255,255,255,0.8)')
-                .attr('stroke', '#fff')
-                .attr('stroke-width', 1)
-                .attr('class', 'neural-nucleus')
-                .attr('data-original-r', d => d.size * 0.3);
-        }
-    });
-
-    nodeEnter.append('text')
-        .attr('dy', d => d.size + 20)
-        .text(d => d.label)
-        .attr('font-size', d => Math.max(12, d.size / 1.5))
-        .attr('class', 'neural-label');
-
-    node = nodeEnter.merge(node);
-
-    // Interactions
-    node.on('mouseover', showTooltip)
-        .on('mouseout', hideTooltip)
-        .on('click', showNodeDetails);
-
-    // Update simulation with new data
-    updateSimulation(link, node);
-
-    // Animate neural nodes
-    animateNeuralNodes();
+    // Create 3D visualization
+    create3DNodes();
 }
 
-function getLinkColor(type) {
-    const colors = {
-        'contains': 'rgba(0, 240, 255, 0.3)',
-        'executes': 'rgba(255, 170, 0, 0.3)',
-        'modifies': 'rgba(255, 204, 0, 0.3)',
-        'threw': 'rgba(255, 0, 68, 0.4)'
-    };
-    return colors[type] || 'rgba(255, 255, 255, 0.2)';
-}
-
-function showTooltip(event, d) {
-    const tooltip = document.getElementById('tooltip');
-    let content = `<div class="tooltip-title">${d.label}</div>`;
-
-    if (d.type === 'project') {
-        content += `<div class="tooltip-sub">${d.path}</div>`;
-        content += `<div>Sessions: ${d.sessions} | Actions: ${d.actions}</div>`;
-    } else if (d.type === 'session') {
-        content += `<div class="tooltip-sub">${d.id}</div>`;
-        content += `<div>Status: ${d.status} | Agent: ${d.agent}</div>`;
-        content += `<div>Model: ${d.model}</div>`;
-    } else if (d.type === 'action') {
-        content += `<div class="tooltip-sub">${d.tool}</div>`;
-        content += `<div>${d.summary}</div>`;
-        if (d.status) content += `<div>Status: ${d.status}</div>`;
-    } else if (d.type === 'error') {
-        content += `<div class="tooltip-sub">${d.message}</div>`;
-    } else if (d.type === 'file') {
-        content += `<div class="tooltip-sub">${d.path}</div>`;
-        content += `<div>Edits: ${d.edits}</div>`;
-    }
-
-    tooltip.innerHTML = content;
-    tooltip.style.left = (event.pageX + 15) + 'px';
-    tooltip.style.top = (event.pageY - 10) + 'px';
-    tooltip.style.opacity = 1;
-}
-
-function hideTooltip() {
-    document.getElementById('tooltip').style.opacity = 0;
-}
-
-function showNodeDetails(event, d) {
-    const info = document.getElementById('node-info');
-    let html = `<span class="type-badge ${d.type}">${d.type}</span>`;
-    html += `<h4 style="margin: 8px 0; color: ${d.color}">${d.label}</h4>`;
-
-    const fields = {
-        project: ['path', 'sessions', 'actions'],
-        session: ['id', 'status', 'agent', 'model', 'actions', 'errors', 'duration', 'started'],
-        action: ['tool', 'summary', 'status', 'attempt', 'time'],
-        error: ['message', 'stack', 'time'],
-        file: ['path', 'edits']
-    };
-
-    const labels = {
-        path: 'Path', sessions: 'Sessions', actions: 'Actions',
-        id: 'Session ID', status: 'Status', agent: 'Agent',
-        model: 'Model', errors: 'Errors', duration: 'Duration (s)',
-        started: 'Started', tool: 'Tool', summary: 'Summary',
-        attempt: 'Attempts', time: 'Time', message: 'Message',
-        stack: 'Stack', edits: 'Edit Count'
-    };
-
-    fields[d.type]?.forEach(f => {
-        const val = d[f];
-        if (val !== undefined && val !== null) {
-            html += `<div class="field"><div class="key">${labels[f] || f}</div><div class="val">${String(val).slice(0, 300)}</div></div>`;
-        }
-    });
-
-    info.innerHTML = html;
-
-    // Highlight connected nodes
-    highlightConnections(d);
-}
-
-function highlightConnections(d) {
-    const connectedIds = new Set();
-    links.forEach(l => {
-        if (l.source.id === d.id) connectedIds.add(l.target.id);
-        if (l.target.id === d.id) connectedIds.add(l.source.id);
-    });
-
-    svg.selectAll('.node')
-        .style('opacity', n => n.id === d.id || connectedIds.has(n.id) ? 1 : 0.2);
-
-    svg.selectAll('.link')
-        .style('opacity', l => l.source.id === d.id || l.target.id === d.id ? 0.8 : 0.05);
-}
-
+// Load statistics
 function loadStats() {
     fetch('/api/stats')
         .then(r => r.json())
@@ -355,6 +330,7 @@ function loadStats() {
         });
 }
 
+// Handle live events
 function handleLiveEvent(eventType, data) {
     const typeMap = {
         'session_start': { label: 'Session Started', class: 'session' },
@@ -372,6 +348,7 @@ function handleLiveEvent(eventType, data) {
     flashGraph();
 }
 
+// Add event to feed
 function addEvent(type, label, data) {
     const feed = document.getElementById('events-feed');
     const item = document.createElement('div');
@@ -399,522 +376,16 @@ function addEvent(type, label, data) {
     }
 }
 
+// Flash effect on graph
 function flashGraph() {
-    const container = document.getElementById('graph-container');
+    const container = document.getElementById('three-container');
     container.style.boxShadow = 'inset 0 0 100px rgba(0, 240, 255, 0.1)';
     setTimeout(() => {
         container.style.boxShadow = 'none';
     }, 300);
 }
 
-function dragstarted(event, d) {
-    if (!event.active) simulation.alphaTarget(0.3).restart();
-    d.fx = d.x;
-    d.fy = d.y;
-}
-
-function dragged(event, d) {
-    d.fx = event.x;
-    d.fy = event.y;
-}
-
-function dragended(event, d) {
-    if (!event.active) simulation.alphaTarget(0);
-    d.fx = null;
-    d.fy = null;
-}
-
-// Utility function to create hexagon points
-function hexagonPoints(size) {
-    const points = [];
-    for (let i = 0; i < 6; i++) {
-        const angle = (Math.PI / 3) * i;
-        const x = size * Math.cos(angle);
-        const y = size * Math.sin(angle);
-        points.push(`${x},${y}`);
-    }
-    return points.join(' ');
-}
-
-// Neural morphing path generator
-function getMorphPath(type, size) {
-    switch (type) {
-        case 'project':
-            // Complex project shape
-            return `M ${-size} ${-size*0.5}
-                    C ${-size*0.7} ${-size} ${size*0.7} ${-size} ${size} ${-size*0.5}
-                    C ${size} ${size*0.2} ${size*0.5} ${size} 0 ${size}
-                    C ${-size*0.5} ${size} ${-size} ${size*0.2} ${-size} ${-size*0.5} Z`;
-        case 'session':
-            // Flowing session shape
-            return `M 0 ${-size}
-                    C ${size*0.8} ${-size*0.5} ${size*0.8} ${size*0.5} 0 ${size}
-                    C ${-size*0.8} ${size*0.5} ${-size*0.8} ${-size*0.5} 0 ${-size} Z`;
-        case 'error':
-            // Sharp error shape
-            return `M 0 ${-size}
-                    L ${size*0.8} 0
-                    L 0 ${size}
-                    L ${-size*0.8} 0 Z`;
-        case 'file':
-            // Document-like file shape
-            return `M ${-size*0.6} ${-size}
-                    L ${size*0.6} ${-size}
-                    L ${size*0.6} ${size*0.4}
-                    L ${size*0.4} ${size*0.6}
-                    L ${-size*0.6} ${size*0.6} Z
-                    M ${size*0.6} ${-size}
-                    L ${size*0.4} ${-size*0.4}
-                    L ${size*0.6} ${-size*0.4}`;
-        default:
-            // Organic action shape
-            return `M 0 ${-size}
-                    C ${size*0.5} ${-size*0.8} ${size*0.8} ${-size*0.5} ${size} 0
-                    C ${size*0.8} ${size*0.5} ${size*0.5} ${size*0.8} 0 ${size}
-                    C ${-size*0.5} ${size*0.8} ${-size*0.8} ${size*0.5} ${-size} 0
-                    C ${-size*0.8} ${-size*0.5} ${-size*0.5} ${-size*0.8} 0 ${-size} Z`;
-    }
-}
-
-// Update minimap after simulation tick
-function updateSimulation(link, node) {
-    simulation.nodes(nodes).on('tick', () => {
-        link
-            .attr('x1', d => d.source.x)
-            .attr('y1', d => d.source.y)
-            .attr('x2', d => d.target.x)
-            .attr('y2', d => d.target.y);
-
-        node.attr('transform', d => `translate(${d.x},${d.y})`);
-
-        // Update minimap on each tick
-        updateMinimap();
-    });
-
-    simulation.force('link').links(links);
-    simulation.alpha(0.3).restart();
-}
-
-// Neural network animation
-function animateNeuralNodes() {
-    // Animate dendrites
-    d3.selectAll('.neural-dendrite')
-        .transition()
-        .duration(2000 + Math.random() * 3000)
-        .attr('opacity', 0.1)
-        .transition()
-        .duration(2000 + Math.random() * 3000)
-        .attr('opacity', 0.4)
-        .on('end', function() {
-            // Restart animation
-            d3.select(this).transition().duration(100).on('end', animateNeuralNodes);
-        });
-
-    // Animate node bodies
-    d3.selectAll('.neural-body')
-        .transition()
-        .duration(3000 + Math.random() * 2000)
-        .attr('opacity', 0.7)
-        .transition()
-        .duration(3000 + Math.random() * 2000)
-        .attr('opacity', 0.9)
-        .on('end', function() {
-            // Restart animation
-            d3.select(this).transition().duration(100).on('end', animateNeuralNodes);
-        });
-
-    // Animate nuclei
-    d3.selectAll('.neural-nucleus')
-        .transition()
-        .duration(1500 + Math.random() * 1000)
-        .attr('r', function() {
-            const original = parseFloat(d3.select(this).attr('data-original-r'));
-            return original * 0.8;
-        })
-        .transition()
-        .duration(1500 + Math.random() * 1000)
-        .attr('r', function() {
-            return d3.select(this).attr('data-original-r');
-        })
-        .on('end', function() {
-            // Restart animation
-            d3.select(this).transition().duration(100).on('end', animateNeuralNodes);
-        });
-}
-
-// Particles effect
-let particlesCanvas, particlesCtx, particles = [];
-
-function initParticles() {
-    particlesCanvas = document.getElementById('particles');
-    particlesCtx = particlesCanvas.getContext('2d');
-    resizeParticles();
-
-    // Create particles
-    const particleCount = Math.floor((width * height) / 10000);
-    for (let i = 0; i < particleCount; i++) {
-        particles.push({
-            x: Math.random() * width,
-            y: Math.random() * height,
-            radius: Math.random() * 1.5 + 0.5,
-            color: `rgba(0, 240, 255, ${Math.random() * 0.3 + 0.1})`,
-            speedX: (Math.random() - 0.5) * 0.5,
-            speedY: (Math.random() - 0.5) * 0.5,
-            angle: Math.random() * Math.PI * 2,
-            rotationSpeed: (Math.random() - 0.5) * 0.02
-        });
-    }
-
-    animateParticles();
-}
-
-function resizeParticles() {
-    particlesCanvas.width = width;
-    particlesCanvas.height = height;
-}
-
-function animateParticles() {
-    particlesCtx.clearRect(0, 0, width, height);
-
-    particles.forEach(p => {
-        // Update position
-        p.x += p.speedX;
-        p.y += p.speedY;
-
-        // Bounce off edges
-        if (p.x < 0 || p.x > width) p.speedX *= -1;
-        if (p.y < 0 || p.y > height) p.speedY *= -1;
-
-        // Draw particle
-        particlesCtx.beginPath();
-        particlesCtx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
-        particlesCtx.fillStyle = p.color;
-        particlesCtx.fill();
-
-        // Draw connecting lines between nearby particles
-        particles.forEach(p2 => {
-            const dx = p.x - p2.x;
-            const dy = p.y - p2.y;
-            const distance = Math.sqrt(dx * dx + dy * dy);
-
-            if (distance < 100) {
-                particlesCtx.beginPath();
-                particlesCtx.moveTo(p.x, p.y);
-                particlesCtx.lineTo(p2.x, p2.y);
-                particlesCtx.strokeStyle = `rgba(0, 240, 255, ${0.1 * (1 - distance / 100)})`;
-                particlesCtx.lineWidth = 0.5;
-                particlesCtx.stroke();
-            }
-        });
-    });
-
-    requestAnimationFrame(animateParticles);
-}
-
-// Sparkline functionality
-let sparklineData = [];
-const MAX_SPARKLINE_POINTS = 30;
-
-function initSparkline() {
-    const svg = d3.select('#sparkline');
-    const width = 120;
-    const height = 30;
-
-    // Add gradient
-    const gradient = svg.append('defs')
-        .append('linearGradient')
-        .attr('id', 'sparkGradient')
-        .attr('x1', '0%')
-        .attr('y1', '0%')
-        .attr('x2', '0%')
-        .attr('y2', '100%');
-
-    gradient.append('stop')
-        .attr('offset', '0%')
-        .attr('stop-color', 'var(--neon-green)')
-        .attr('stop-opacity', 0.8);
-
-    gradient.append('stop')
-        .attr('offset', '100%')
-        .attr('stop-color', 'var(--neon-green)')
-        .attr('stop-opacity', 0);
-
-    // Initialize sparkline data
-    for (let i = 0; i < MAX_SPARKLINE_POINTS; i++) {
-        sparklineData.push(0);
-    }
-
-    updateSparkline();
-    setInterval(updateSparklineData, 1000);
-}
-
-function updateSparklineData() {
-    // In a real implementation, this would fetch actual actions data
-    // For now, we'll simulate with random values
-    const newValue = Math.floor(Math.random() * 10);
-    sparklineData.shift();
-    sparklineData.push(newValue);
-    updateSparkline();
-}
-
-function updateSparkline() {
-    const svg = d3.select('#sparkline');
-    const width = 120;
-    const height = 30;
-
-    svg.selectAll('*').remove();
-
-    const x = d3.scaleLinear()
-        .domain([0, sparklineData.length - 1])
-        .range([0, width]);
-
-    const y = d3.scaleLinear()
-        .domain([0, d3.max(sparklineData) || 1])
-        .range([height, 0]);
-
-    const line = d3.line()
-        .x((d, i) => x(i))
-        .y(d => y(d))
-        .curve(d3.curveMonotoneX);
-
-    const area = d3.area()
-        .x((d, i) => x(i))
-        .y0(height)
-        .y1(d => y(d))
-        .curve(d3.curveMonotoneX);
-
-    // Add area
-    svg.append('path')
-        .datum(sparklineData)
-        .attr('class', 'spark-area')
-        .attr('d', area);
-
-    // Add line
-    svg.append('path')
-        .datum(sparklineData)
-        .attr('class', 'spark-line')
-        .attr('d', line);
-
-    // Add dot for last point
-    const lastPoint = sparklineData[sparklineData.length - 1];
-    svg.append('circle')
-        .attr('class', 'spark-dot')
-        .attr('cx', x(sparklineData.length - 1))
-        .attr('cy', y(lastPoint))
-        .attr('r', 3);
-}
-
-// Filters functionality
-let activeFilters = {
-    project: true,
-    session: true,
-    action: true,
-    error: true,
-    file: true
-};
-let selectedProject = '';
-
-function initFilters() {
-    // Type filters
-    document.querySelectorAll('.filter-type').forEach(checkbox => {
-        checkbox.addEventListener('change', (e) => {
-            const type = e.target.dataset.type;
-            activeFilters[type] = e.target.checked;
-            applyFilters();
-        });
-    });
-
-    // Project filter
-    document.getElementById('project-filter').addEventListener('change', (e) => {
-        selectedProject = e.target.value;
-        applyFilters();
-    });
-
-    // Search
-    document.getElementById('search-box').addEventListener('input', (e) => {
-        const term = e.target.value.toLowerCase();
-        searchNodes(term);
-    });
-
-    // Reset button
-    document.getElementById('btn-reset').addEventListener('click', resetView);
-}
-
-function applyFilters() {
-    svg.selectAll('.node')
-        .classed('dimmed', d => !activeFilters[d.type]);
-
-    svg.selectAll('.link')
-        .classed('dimmed', d => {
-            const sourceNode = nodes.find(n => n.id === d.source.id || n.id === d.source);
-            const targetNode = nodes.find(n => n.id === d.target.id || n.id === d.target);
-            return !activeFilters[sourceNode?.type] || !activeFilters[targetNode?.type];
-        });
-
-    // Apply project filter if selected
-    if (selectedProject) {
-        svg.selectAll('.node')
-            .classed('dimmed', d => {
-                if (!activeFilters[d.type]) return true;
-                return d.project !== selectedProject && d.type !== 'project';
-            });
-    }
-}
-
-function updateProjectFilter(projects) {
-    const select = document.getElementById('project-filter');
-    select.innerHTML = '<option value="">All Projects</option>';
-
-    projects.forEach(project => {
-        const option = document.createElement('option');
-        option.value = project.id;
-        option.textContent = project.label;
-        select.appendChild(option);
-    });
-}
-
-function searchNodes(term) {
-    if (!term) {
-        svg.selectAll('.node').classed('search-match', false);
-        return;
-    }
-
-    svg.selectAll('.node')
-        .classed('search-match', d =>
-            d.label.toLowerCase().includes(term) ||
-            (d.path && d.path.toLowerCase().includes(term)) ||
-            (d.id && d.id.toLowerCase().includes(term))
-        );
-}
-
-function resetView() {
-    // Reset zoom
-    svg.transition().duration(750).call(
-        d3.zoom().transform,
-        d3.zoomIdentity
-    );
-
-    // Reset filters
-    document.querySelectorAll('.filter-type').forEach(checkbox => {
-        checkbox.checked = true;
-        const type = checkbox.dataset.type;
-        activeFilters[type] = true;
-    });
-
-    document.getElementById('project-filter').value = '';
-    selectedProject = '';
-
-    document.getElementById('search-box').value = '';
-
-    // Reset node highlighting
-    svg.selectAll('.node')
-        .classed('dimmed', false)
-        .classed('highlighted', false)
-        .classed('search-match', false);
-
-    svg.selectAll('.link')
-        .classed('dimmed', false);
-
-    // Reset info panel
-    document.getElementById('node-info').innerHTML = '<p class="placeholder">Select a node to view details</p>';
-}
-
-// Minimap functionality
-let minimapSvg, minimapWidth, minimapHeight;
-
-function initMinimap() {
-    minimapSvg = d3.select('#minimap');
-    const container = document.getElementById('minimap-container');
-    minimapWidth = container.clientWidth;
-    minimapHeight = container.clientHeight;
-
-    updateMinimap();
-}
-
-function updateMinimap() {
-    if (!minimapSvg || !nodes.length) return;
-
-    minimapSvg.selectAll('*').remove();
-
-    // Calculate bounds of all nodes
-    const xExtent = d3.extent(nodes, d => d.x);
-    const yExtent = d3.extent(nodes, d => d.y);
-
-    // Add some padding
-    const padding = 50;
-    const bounds = {
-        x0: xExtent[0] - padding,
-        y0: yExtent[0] - padding,
-        x1: xExtent[1] + padding,
-        y1: yExtent[1] + padding
-    };
-
-    // Calculate scale to fit nodes in minimap
-    const scale = Math.min(
-        minimapWidth / (bounds.x1 - bounds.x0),
-        minimapHeight / (bounds.y1 - bounds.y0)
-    );
-
-    // Draw nodes on minimap
-    minimapSvg.selectAll('.minimap-node')
-        .data(nodes)
-        .enter()
-        .append('circle')
-        .attr('class', 'minimap-node')
-        .attr('cx', d => (d.x - bounds.x0) * scale)
-        .attr('cy', d => (d.y - bounds.y0) * scale)
-        .attr('r', d => Math.max(1, d.size * scale / 2))
-        .attr('fill', d => d.color)
-        .attr('opacity', 0.7);
-
-    // Draw links on minimap
-    minimapSvg.selectAll('.minimap-link')
-        .data(links)
-        .enter()
-        .append('line')
-        .attr('class', 'minimap-link')
-        .attr('x1', d => (d.source.x - bounds.x0) * scale)
-        .attr('y1', d => (d.source.y - bounds.y0) * scale)
-        .attr('x2', d => (d.target.x - bounds.x0) * scale)
-        .attr('y2', d => (d.target.y - bounds.y0) * scale)
-        .attr('stroke', 'rgba(255, 255, 255, 0.2)')
-        .attr('stroke-width', 0.5);
-
-    // Update viewport indicator
-    updateMinimapViewport(bounds, scale);
-}
-
-function updateMinimapViewport(bounds, scale) {
-    const viewport = document.getElementById('minimap-viewport');
-    const graphContainer = document.getElementById('graph-container');
-
-    // Get current transform of main graph
-    const transform = d3.zoomTransform(svg.node());
-
-    // Calculate viewport dimensions
-    const graphWidth = graphContainer.clientWidth;
-    const graphHeight = graphContainer.clientHeight;
-
-    // Calculate visible area in graph coordinates
-    const visibleX0 = -transform.x / transform.k;
-    const visibleY0 = -transform.y / transform.k;
-    const visibleX1 = visibleX0 + graphWidth / transform.k;
-    const visibleY1 = visibleY0 + graphHeight / transform.k;
-
-    // Convert to minimap coordinates
-    const minimapX0 = (visibleX0 - bounds.x0) * scale;
-    const minimapY0 = (visibleY0 - bounds.y0) * scale;
-    const minimapX1 = (visibleX1 - bounds.x0) * scale;
-    const minimapY1 = (visibleY1 - bounds.y0) * scale;
-
-    // Update viewport indicator
-    viewport.style.left = `${minimapX0}px`;
-    viewport.style.top = `${minimapY0}px`;
-    viewport.style.width = `${minimapX1 - minimapX0}px`;
-    viewport.style.height = `${minimapY1 - minimapY0}px`;
-}
-
-// Controls functionality
+// Initialize controls
 function initControls() {
     // Export PNG
     document.getElementById('btn-export-png').addEventListener('click', exportPNG);
@@ -924,12 +395,48 @@ function initControls() {
 
     // Toggle theme
     document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+
+    // Reset view
+    document.getElementById('btn-reset').addEventListener('click', resetView);
+
+    // Search
+    document.getElementById('search-box').addEventListener('input', (e) => {
+        const term = e.target.value.toLowerCase();
+        searchNodes(term);
+    });
 }
 
+// Initialize interface selector
+function initInterfaceSelector() {
+    document.querySelectorAll('.interface-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            // Remove active class from all buttons
+            document.querySelectorAll('.interface-btn').forEach(b => b.classList.remove('active'));
+
+            // Add active class to clicked button
+            e.target.classList.add('active');
+
+            // Hide all visualizations
+            document.querySelectorAll('.visualization').forEach(viz => viz.classList.remove('active'));
+
+            // Show selected visualization
+            const interfaceType = e.target.dataset.interface;
+            document.getElementById(`${interfaceType}-view`).classList.add('active');
+
+            // If switching to 3D graph, re-render
+            if (interfaceType === 'graph') {
+                camera.aspect = document.getElementById('three-container').clientWidth / document.getElementById('three-container').clientHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(document.getElementById('three-container').clientWidth, document.getElementById('three-container').clientHeight);
+            }
+        });
+    });
+}
+
+// Export PNG
 function exportPNG() {
-    // Use html2canvas library that should be included
     if (typeof html2canvas !== 'undefined') {
-        html2canvas(document.getElementById('graph-container')).then(canvas => {
+        html2canvas(document.getElementById('visualization-container')).then(canvas => {
             const link = document.createElement('a');
             link.download = `persistence-graph-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.png`;
             link.href = canvas.toDataURL('image/png');
@@ -940,6 +447,7 @@ function exportPNG() {
     }
 }
 
+// Export JSON
 function exportJSON() {
     const data = {
         nodes: nodes,
@@ -958,6 +466,7 @@ function exportJSON() {
     URL.revokeObjectURL(url);
 }
 
+// Toggle theme
 function toggleTheme() {
     const themeLink = document.getElementById('theme-stylesheet');
     themeLink.disabled = !themeLink.disabled;
@@ -965,3 +474,153 @@ function toggleTheme() {
     // Save preference to localStorage
     localStorage.setItem('persistence-theme', themeLink.disabled ? 'default' : 'cyberpunk');
 }
+
+// Reset view
+function resetView() {
+    // Reset camera position
+    controls.reset();
+
+    // Reset search
+    document.getElementById('search-box').value = '';
+
+    // Reset node highlighting
+    threeNodes.forEach(node3d => {
+        node3d.material.opacity = 0.9;
+        node3d.material.emissiveIntensity = 0.5;
+    });
+
+    // Reset link highlighting
+    threeLinks.forEach(link => {
+        link.material.opacity = 0.4;
+    });
+
+    // Reset info panel
+    document.getElementById('node-info').innerHTML = '<p class="placeholder">Select a node to view details</p>';
+}
+
+// Search nodes
+function searchNodes(term) {
+    if (!term) {
+        threeNodes.forEach(node3d => {
+            node3d.material.opacity = 0.9;
+            node3d.material.emissiveIntensity = 0.5;
+        });
+        return;
+    }
+
+    // Find matching nodes
+    const matchingIds = new Set();
+    nodes.forEach(node => {
+        if (node.label.toLowerCase().includes(term) ||
+            (node.path && node.path.toLowerCase().includes(term)) ||
+            (node.id && node.id.toLowerCase().includes(term))) {
+            matchingIds.add(node.id);
+        }
+    });
+
+    // Highlight matching nodes
+    threeNodes.forEach((node3d, id) => {
+        if (matchingIds.has(id)) {
+            node3d.material.opacity = 1;
+            node3d.material.emissiveIntensity = 1;
+        } else {
+            node3d.material.opacity = 0.3;
+            node3d.material.emissiveIntensity = 0.2;
+        }
+    });
+}
+
+// Handle node click
+function showNodeDetails(event) {
+    // Raycast to find clicked node
+    const raycaster = new THREE.Raycaster();
+    const mouse = new THREE.Vector2();
+
+    // Calculate mouse position in normalized device coordinates
+    mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+    mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+    // Update the picking ray with the camera and mouse position
+    raycaster.setFromCamera(mouse, camera);
+
+    // Calculate objects intersecting the picking ray
+    const intersects = raycaster.intersectObjects(scene.children);
+
+    for (let i = 0; i < intersects.length; i++) {
+        if (intersects[i].object.userData.id) {
+            const nodeId = intersects[i].object.userData.id;
+            const nodeData = nodes.find(n => n.id === nodeId);
+
+            if (nodeData) {
+                const info = document.getElementById('node-info');
+                let html = `<span class="type-badge ${nodeData.type}">${nodeData.type}</span>`;
+                html += `<h4 style="margin: 8px 0; color: ${nodeData.color}">${nodeData.label}</h4>`;
+
+                const fields = {
+                    project: ['path', 'sessions', 'actions'],
+                    session: ['id', 'status', 'agent', 'model', 'actions', 'errors', 'duration', 'started'],
+                    action: ['tool', 'summary', 'status', 'attempt', 'time'],
+                    error: ['message', 'stack', 'time'],
+                    file: ['path', 'edits']
+                };
+
+                const labels = {
+                    path: 'Path', sessions: 'Sessions', actions: 'Actions',
+                    id: 'Session ID', status: 'Status', agent: 'Agent',
+                    model: 'Model', errors: 'Errors', duration: 'Duration (s)',
+                    started: 'Started', tool: 'Tool', summary: 'Summary',
+                    attempt: 'Attempts', time: 'Time', message: 'Message',
+                    stack: 'Stack', edits: 'Edit Count'
+                };
+
+                fields[nodeData.type]?.forEach(f => {
+                    const val = nodeData[f];
+                    if (val !== undefined && val !== null) {
+                        html += `<div class="field"><div class="key">${labels[f] || f}</div><div class="val">${String(val).slice(0, 300)}</div></div>`;
+                    }
+                });
+
+                info.innerHTML = html;
+
+                // Highlight connected nodes
+                highlightConnectedNodes(nodeId);
+                break;
+            }
+        }
+    }
+}
+
+// Highlight connected nodes
+function highlightConnectedNodes(nodeId) {
+    // Find connected node IDs
+    const connectedIds = new Set();
+    links.forEach(link => {
+        if (link.source.id === nodeId) connectedIds.add(link.target.id);
+        if (link.target.id === nodeId) connectedIds.add(link.source.id);
+    });
+
+    // Highlight nodes
+    threeNodes.forEach((node3d, id) => {
+        if (id === nodeId) {
+            node3d.material.opacity = 1;
+            node3d.material.emissiveIntensity = 1.5;
+        } else if (connectedIds.has(id)) {
+            node3d.material.opacity = 0.9;
+            node3d.material.emissiveIntensity = 1;
+        } else {
+            node3d.material.opacity = 0.2;
+            node3d.material.emissiveIntensity = 0.1;
+        }
+    });
+
+    // Highlight links
+    threeLinks.forEach(link => {
+        // This is a simplification - in a real implementation, we'd need to track which links connect to which nodes
+        link.material.opacity = 0.7;
+    });
+}
+
+// Add event listener for node clicks
+document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('three-container').addEventListener('click', showNodeDetails);
+});
