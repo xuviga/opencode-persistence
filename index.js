@@ -10,6 +10,28 @@ import { mkdir } from "fs/promises"
 import path from "path"
 import os from "os"
 
+// Dashboard module (lazy loaded)
+let dashboard = null
+async function initDashboard(dbInstance) {
+  try {
+    dashboard = await import("./dashboard/server.js")
+    dashboard.init(dbInstance)
+    dashboard.start()
+  } catch (e) {
+    console.error("[Persistence] Dashboard failed to start:", e.message)
+  }
+}
+
+function broadcastDashboardEvent(eventType, data) {
+  if (!dashboard) return
+  try { dashboard.onEvent(eventType, data) } catch {}
+}
+
+function broadcastActionEvent(data) {
+  if (!dashboard) return
+  try { dashboard.onActionEvent(data) } catch {}
+}
+
 const MEMORY_DIR = path.join(process.env.APPDATA || path.join(os.homedir(), ".config"), "opencode", "memory")
 const DB_PATH = path.join(MEMORY_DIR, "memory.db")
 
@@ -52,6 +74,9 @@ async function ensureStorage() {
 
   autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 30_000)
   if (autoSaveTimer.unref) autoSaveTimer.unref()
+
+  // Start dashboard
+  await initDashboard(db)
 }
 
 let mutexQueue = Promise.resolve()
@@ -405,6 +430,7 @@ export async function PersistencePlugin(input, options = {}) {
     "tool.execute.after": async (input, output) => {
       const result = output.output || "", isErr = isGenuineError(input.tool, result)
       await rAction(isErr ? "error" : "action", `${input.tool}: ${short(result, 120)}`, input.sessionID, input.tool, input.callID)
+      broadcastActionEvent({ tool: input.tool, summary: short(result, 100), session_id: input.sessionID, isError: isErr })
       pendingToolOutputs.push(result); if (pendingToolOutputs.length > 5) pendingToolOutputs = pendingToolOutputs.slice(-5)
       await flush()
     },
@@ -418,12 +444,18 @@ export async function PersistencePlugin(input, options = {}) {
       switch (event.type) {
         case "session.created": {
           const info = event.properties?.info, sid = info?.id || event.properties?.sessionID
-          if (sid) await rSession(sid, info?.agent, info?.model, projectDir)
+          if (sid) {
+            await rSession(sid, info?.agent, info?.model, projectDir)
+            broadcastDashboardEvent('session_start', { session_id: sid, agent: info?.agent, model: info?.model, project_dir: projectDir })
+          }
           break
         }
         case "session.deleted": case "session.compacted": {
           const sid = event.properties?.sessionID
-          if (sid) await rCloseSession(sid, event.type === "session.deleted" ? "deleted" : "compacted")
+          if (sid) {
+            await rCloseSession(sid, event.type === "session.deleted" ? "deleted" : "compacted")
+            broadcastDashboardEvent('session_end', { session_id: sid, reason: event.type })
+          }
           break
         }
         case "message.updated": {
@@ -441,7 +473,12 @@ export async function PersistencePlugin(input, options = {}) {
         }
         case "file.edited": {
           const file = event.properties?.file
-          if (file) { currentSessionFiles.add(file); await rFileChange(file, event.properties?.sessionID, "edit", 0, 0); await flush() }
+          if (file) {
+            currentSessionFiles.add(file)
+            await rFileChange(file, event.properties?.sessionID, "edit", 0, 0)
+            broadcastDashboardEvent('file_edit', { file, session_id: event.properties?.sessionID })
+            await flush()
+          }
           break
         }
         case "session.diff": {
@@ -456,7 +493,11 @@ export async function PersistencePlugin(input, options = {}) {
         }
         case "session.error": {
           const err = event.properties?.error, sid = event.properties?.sessionID
-          if (err) { await rSessionError(sid, err.name, err.data?.message || JSON.stringify(err.data).slice(0, 300)); await flush() }
+          if (err) {
+            await rSessionError(sid, err.name, err.data?.message || JSON.stringify(err.data).slice(0, 300))
+            broadcastDashboardEvent('error', { session_id: sid, error_type: err.name, message: err.data?.message || "Unknown" })
+            await flush()
+          }
           break
         }
       }

@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>XuViGaN Persistence Dashboard</title>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="app">
+        <header>
+            <h1>XuViGaN <span class="neon">PERSISTENCE</span></h1>
+            <div id="stats">
+                <div class="stat"><span class="label">Projects</span><span class="value" id="stat-projects">0</span></div>
+                <div class="stat"><span class="label">Sessions</span><span class="value" id="stat-sessions">0</span></div>
+                <div class="stat"><span class="label">Actions</span><span class="value" id="stat-actions">0</span></div>
+                <div class="stat"><span class="label">Errors</span><span class="value" id="stat-errors">0</span></div>
+                <div class="stat"><span class="label">Files</span><span class="value" id="stat-files">0</span></div>
+                <div class="stat live"><span class="pulse"></span> LIVE</div>
+            </div>
+        </header>
+
+        <main>
+            <div id="sidebar">
+                <div class="panel">
+                    <h3>Node Details</h3>
+                    <div id="node-info">
+                        <p class="hint">Click a node to inspect</p>
+                    </div>
+                </div>
+                <div class="panel">
+                    <h3>Live Events</h3>
+                    <div id="events-feed"></div>
+                </div>
+            </div>
+
+            <div id="graph-container">
+                <svg id="graph"></svg>
+                <div id="tooltip"></div>
+            </div>
+        </main>
+    </div>
+
+    <script src="live.js"></script>
+</body>
+</html>
