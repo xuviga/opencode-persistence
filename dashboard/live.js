@@ -86,8 +86,87 @@ function initThreeJS() {
     controls.minDistance = 10;
     controls.maxDistance = 200;
 
+    // Add fog for depth perception
+    scene.fog = new THREE.FogExp2(0x0a0a12, 0.025);
+
+    // Add starfield background
+    createStarfield();
+
+    // Add physics simulation for nodes
+    initNodePhysics();
+
     // Animation loop
     animate();
+}
+
+// Node physics simulation
+function initNodePhysics() {
+    // Create spring physics for nodes
+    setInterval(() => {
+        threeNodes.forEach((node3d, id) => {
+            // Find connected nodes
+            const connectedNodes = [];
+            links.forEach(link => {
+                if (link.source.id === id) {
+                    const targetNode = threeNodes.get(link.target.id);
+                    if (targetNode) connectedNodes.push(targetNode);
+                }
+                if (link.target.id === id) {
+                    const sourceNode = threeNodes.get(link.source.id);
+                    if (sourceNode) connectedNodes.push(sourceNode);
+                }
+            });
+
+            // Apply spring forces to connected nodes
+            connectedNodes.forEach(connectedNode => {
+                const distance = node3d.position.distanceTo(connectedNode.position);
+                const idealDistance = 20; // Ideal distance between connected nodes
+
+                if (distance > idealDistance) {
+                    // Calculate spring force
+                    const force = (distance - idealDistance) * 0.01;
+                    const direction = new THREE.Vector3()
+                        .subVectors(connectedNode.position, node3d.position)
+                        .normalize()
+                        .multiplyScalar(force);
+
+                    node3d.position.add(direction);
+                }
+            });
+        });
+    }, 16); // ~60fps
+}
+
+// Create starfield background
+function createStarfield() {
+    const starCount = 2000;
+    const stars = new THREE.BufferGeometry();
+    const positions = new Float32Array(starCount * 3);
+
+    for (let i = 0; i < starCount; i++) {
+        const i3 = i * 3;
+
+        // Positions in a sphere
+        const radius = 150;
+        const theta = 2 * Math.PI * Math.random();
+        const phi = Math.acos(2 * Math.random() - 1);
+
+        positions[i3] = radius * Math.sin(phi) * Math.cos(theta);
+        positions[i3 + 1] = radius * Math.sin(phi) * Math.sin(theta);
+        positions[i3 + 2] = radius * Math.cos(phi);
+    }
+
+    stars.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+    const starMaterial = new THREE.PointsMaterial({
+        color: 0xffffff,
+        size: 1.5,
+        transparent: true,
+        opacity: 0.8
+    });
+
+    const starField = new THREE.Points(stars, starMaterial);
+    scene.add(starField);
 }
 
 // Create particle background
@@ -173,9 +252,19 @@ function create3DNodes() {
     });
     threeLinks = [];
 
-    // Create nodes
+    // Create clusters for related nodes
+    const clusters = createNodeClusters();
+
+    // Create nodes with cluster positions
     nodes.forEach(node => {
         let geometry, material, mesh;
+
+        // Get cluster position if available
+        const cluster = clusters[node.id];
+        let basePosition = [0, 0, 0];
+        if (cluster) {
+            basePosition = cluster.center;
+        }
 
         // Create different geometry based on node type
         switch (node.type) {
@@ -214,10 +303,10 @@ function create3DNodes() {
         // Create mesh
         mesh = new THREE.Mesh(geometry, material);
 
-        // Position randomly in 3D space
-        mesh.position.x = (Math.random() - 0.5) * 80;
-        mesh.position.y = (Math.random() - 0.5) * 80;
-        mesh.position.z = (Math.random() - 0.5) * 80;
+        // Position with some randomness around cluster center
+        mesh.position.x = basePosition[0] + (Math.random() - 0.5) * 20;
+        mesh.position.y = basePosition[1] + (Math.random() - 0.5) * 20;
+        mesh.position.z = basePosition[2] + (Math.random() - 0.5) * 20;
 
         // Store reference
         mesh.userData = { id: node.id, type: node.type };
@@ -257,8 +346,113 @@ function create3DNodes() {
             const linkMesh = new THREE.Mesh(geometry, material);
             scene.add(linkMesh);
             threeLinks.push(linkMesh);
+
+            // Add flow particles to links
+            addFlowParticles(linkMesh, sourceNode, targetNode);
         }
     });
+}
+
+// Create clusters for related nodes
+function createNodeClusters() {
+    const clusters = {};
+    const projectNodes = nodes.filter(n => n.type === 'project');
+
+    // Create a cluster for each project
+    projectNodes.forEach((project, index) => {
+        const angle = (index / projectNodes.length) * Math.PI * 2;
+        const radius = 50;
+        const center = [
+            Math.cos(angle) * radius,
+            Math.sin(angle) * radius,
+            0
+        ];
+
+        // Assign project to its cluster
+        clusters[project.id] = { center };
+
+        // Assign related sessions to the same cluster
+        links.forEach(link => {
+            if (link.type === 'contains' && link.source.id === project.id) {
+                const sessionId = link.target.id;
+                nodes.forEach(node => {
+                    if (node.id === sessionId) {
+                        clusters[node.id] = { center };
+                    }
+                });
+            }
+        });
+    });
+
+    return clusters;
+}
+
+// Add flow particles to links
+function addFlowParticles(linkMesh, sourceNode, targetNode) {
+    const particleCount = 20;
+    const particles = new THREE.BufferGeometry();
+    const positions = new Float32Array(particleCount * 3);
+
+    for (let i = 0; i < particleCount; i++) {
+        const i3 = i * 3;
+        const t = i / particleCount;
+
+        // Position along the curve
+        const point = linkMesh.geometry.parameters.path.getPoint(t);
+        positions[i3] = point.x;
+        positions[i3 + 1] = point.y;
+        positions[i3 + 2] = point.z;
+    }
+
+    particles.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+    const particleMaterial = new THREE.PointsMaterial({
+        color: 0x00f0ff,
+        size: 1,
+        transparent: true,
+        opacity: 0.8
+    });
+
+    const particleSystem = new THREE.Points(particles, particleMaterial);
+    scene.add(particleSystem);
+    threeLinks.push(particleSystem);
+
+    // Animate particles
+    animateFlowParticles(particleSystem, sourceNode, targetNode);
+}
+
+// Animate flow particles
+function animateFlowParticles(particleSystem, sourceNode, targetNode) {
+    const positions = particleSystem.geometry.attributes.position.array;
+    const particleCount = positions.length / 3;
+
+    function animate() {
+        for (let i = 0; i < particleCount; i++) {
+            const i3 = i * 3;
+            let t = (Date.now() * 0.001 + i / particleCount) % 1;
+
+            // Get point along curve
+            const sourcePos = new THREE.Vector3().copy(sourceNode.position);
+            const targetPos = new THREE.Vector3().copy(targetNode.position);
+            const controlPoint = new THREE.Vector3(
+                (sourcePos.x + targetPos.x) / 2,
+                (sourcePos.y + targetPos.y) / 2,
+                (sourcePos.z + targetPos.z) / 2 + 10
+            );
+
+            const curve = new THREE.QuadraticBezierCurve3(sourcePos, controlPoint, targetPos);
+            const point = curve.getPoint(t);
+
+            positions[i3] = point.x;
+            positions[i3 + 1] = point.y;
+            positions[i3 + 2] = point.z;
+        }
+
+        particleSystem.geometry.attributes.position.needsUpdate = true;
+        requestAnimationFrame(animate);
+    }
+
+    animate();
 }
 
 // Get color for link based on type
@@ -357,6 +551,25 @@ function handleLiveEvent(eventType, data) {
     const info = typeMap[eventType] || { label: eventType, class: 'session' };
     addEvent(info.class, info.label, data);
 
+    // Play sound based on event type
+    switch (eventType) {
+        case 'session_start':
+            playSound(440, 0.2); // A4 note
+            break;
+        case 'session_end':
+            playSound(330, 0.2); // E4 note
+            break;
+        case 'action':
+            playSound(523, 0.1); // C5 note
+            break;
+        case 'error':
+            playSound(220, 0.3); // A3 note
+            break;
+        case 'file_edit':
+            playSound(392, 0.15); // G4 note
+            break;
+    }
+
     // Flash effect on graph
     flashGraph();
 }
@@ -408,6 +621,15 @@ function initControls() {
 
     // Toggle theme
     document.getElementById('btn-theme').addEventListener('click', toggleTheme);
+
+    // Toggle sound
+    document.getElementById('btn-sound').addEventListener('click', toggleSound);
+
+    // Toggle VR mode
+    document.getElementById('btn-vr').addEventListener('click', toggleVRMode);
+
+    // Toggle fullscreen
+    document.getElementById('btn-fullscreen').addEventListener('click', toggleFullscreen);
 
     // Reset view
     document.getElementById('btn-reset').addEventListener('click', resetView);
@@ -492,6 +714,14 @@ function renderMatrixView() {
         typeHeader.style.fontWeight = 'bold';
         matrixGrid.appendChild(typeHeader);
 
+        // Create container for this type's items
+        const typeContainer = document.createElement('div');
+        typeContainer.className = 'matrix-type-container';
+        typeContainer.style.display = 'grid';
+        typeContainer.style.gridTemplateColumns = 'repeat(auto-fill, minmax(120px, 1fr))';
+        typeContainer.style.gap = '15px';
+        typeContainer.style.marginBottom = '20px';
+
         nodesByType[type].forEach(node => {
             const matrixItem = document.createElement('div');
             matrixItem.className = 'matrix-item';
@@ -500,16 +730,67 @@ function renderMatrixView() {
             matrixItem.style.color = node.color;
 
             // Add size based on node size
-            const size = Math.max(50, node.size * 5);
+            const size = Math.max(60, node.size * 4);
             matrixItem.style.width = `${size}px`;
             matrixItem.style.height = `${size}px`;
 
-            // Add click event to show details
-            matrixItem.addEventListener('click', () => showNodeDetailsById(node.id));
+            // Add intensity based on activity (sessions count, actions count, etc.)
+            let intensity = 0.5;
+            if (node.sessions) intensity = Math.min(1, node.sessions / 10);
+            else if (node.actions) intensity = Math.min(1, node.actions / 20);
+            else if (node.edits) intensity = Math.min(1, node.edits / 15);
 
-            matrixGrid.appendChild(matrixItem);
+            matrixItem.style.background = `rgba(${hexToRgb(node.color)}, ${intensity * 0.3})`;
+
+            // Add click event to show details
+            matrixItem.addEventListener('click', () => {
+                showNodeDetailsById(node.id);
+                highlightConnectionsInMatrix(node.id);
+            });
+
+            typeContainer.appendChild(matrixItem);
         });
+
+        matrixGrid.appendChild(typeContainer);
     }
+}
+
+function hexToRgb(hex) {
+    // Remove # if present
+    hex = hex.replace('#', '');
+
+    // Parse hex values
+    const r = parseInt(hex.substring(0, 2), 16);
+    const g = parseInt(hex.substring(2, 4), 16);
+    const b = parseInt(hex.substring(4, 6), 16);
+
+    return `${r}, ${g}, ${b}`;
+}
+
+function highlightConnectionsInMatrix(nodeId) {
+    // Find connected node IDs
+    const connectedIds = new Set();
+    links.forEach(link => {
+        if (link.source.id === nodeId) connectedIds.add(link.target.id);
+        if (link.target.id === nodeId) connectedIds.add(link.source.id);
+    });
+
+    // Remove previous highlights
+    document.querySelectorAll('.matrix-item').forEach(item => {
+        item.style.boxShadow = '';
+        item.style.transform = '';
+    });
+
+    // Highlight connected nodes
+    document.querySelectorAll('.matrix-item').forEach(item => {
+        const label = item.textContent;
+        const node = nodes.find(n => n.label === label);
+
+        if (node && (node.id === nodeId || connectedIds.has(node.id))) {
+            item.style.boxShadow = '0 0 20px currentColor';
+            item.style.transform = 'scale(1.1)';
+        }
+    });
 }
 
 function getTypeColor(type) {
@@ -525,11 +806,18 @@ function getTypeColor(type) {
 
 // Wave View Implementation
 let waveAnimationId;
+let mouseX = 0, mouseY = 0;
 
 function initWaveView() {
     const canvas = document.getElementById('wave-canvas');
     canvas.width = document.getElementById('wave-view').clientWidth;
     canvas.height = document.getElementById('wave-view').clientHeight;
+
+    // Add mouse move listener for interactive waves
+    canvas.addEventListener('mousemove', (e) => {
+        mouseX = e.clientX;
+        mouseY = e.clientY;
+    });
 }
 
 function startWaveAnimation() {
@@ -555,14 +843,25 @@ function startWaveAnimation() {
 
             ctx.beginPath();
             ctx.strokeStyle = colors[index];
-            ctx.lineWidth = 2;
+            ctx.lineWidth = 3;
 
-            const amplitude = 20 + typeNodes.length;
-            const frequency = 0.02;
-            const phase = Date.now() * 0.001 + index;
+            const baseAmplitude = 20 + typeNodes.length;
+            const baseFrequency = 0.02;
+            const basePhase = Date.now() * 0.001 + index;
 
             for (let x = 0; x < width; x += 5) {
-                const y = height / 2 + Math.sin(x * frequency + phase) * amplitude;
+                // Base wave
+                let y = height / 2 + Math.sin(x * baseFrequency + basePhase) * baseAmplitude;
+
+                // Add mouse interaction
+                const distanceToMouse = Math.abs(x - mouseX);
+                if (distanceToMouse < 150) {
+                    const mouseEffect = (1 - distanceToMouse / 150) * 50;
+                    y += Math.sin(x * 0.05 + basePhase) * mouseEffect;
+                }
+
+                // Add secondary wave for complexity
+                y += Math.sin(x * 0.01 + basePhase * 1.5) * 10;
 
                 if (x === 0) {
                     ctx.moveTo(x, y);
@@ -572,12 +871,40 @@ function startWaveAnimation() {
             }
 
             ctx.stroke();
+
+            // Add particles on top of the wave
+            drawWaveParticles(ctx, colors[index], width, height, baseAmplitude, baseFrequency, basePhase);
         });
 
         waveAnimationId = requestAnimationFrame(drawWave);
     }
 
     drawWave();
+}
+
+function drawWaveParticles(ctx, color, width, height, amplitude, frequency, phase) {
+    const particleCount = 20;
+
+    ctx.fillStyle = color;
+
+    for (let i = 0; i < particleCount; i++) {
+        const x = (i / particleCount) * width;
+        const y = height / 2 + Math.sin(x * frequency + phase) * amplitude;
+
+        // Draw particle with glow effect
+        ctx.beginPath();
+        ctx.arc(x, y, 3 + Math.sin(Date.now() * 0.005 + i) * 2, 0, Math.PI * 2);
+        ctx.fill();
+
+        // Draw glow
+        ctx.beginPath();
+        ctx.arc(x, y, 6 + Math.sin(Date.now() * 0.005 + i) * 2, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${hexToRgb(color)}, ${0.3 + Math.sin(Date.now() * 0.005 + i) * 0.2})`;
+        ctx.fill();
+
+        // Restore fill style for next particle
+        ctx.fillStyle = color;
+    }
 }
 
 // Cloud View Implementation
@@ -589,26 +916,133 @@ function renderCloudView() {
     const cloudContainer = document.getElementById('cloud-container');
     cloudContainer.innerHTML = '';
 
+    // Create a container for cloud items
+    const cloudInner = document.createElement('div');
+    cloudInner.className = 'cloud-inner';
+    cloudContainer.appendChild(cloudInner);
+
     // Create word cloud based on node labels
     nodes.forEach(node => {
         const cloudItem = document.createElement('div');
         cloudItem.className = 'cloud-item';
         cloudItem.textContent = node.label;
         cloudItem.style.color = node.color;
+        cloudItem.dataset.id = node.id;
 
-        // Set size based on node size
-        const size = 12 + node.size;
+        // Set size based on node size and type
+        let size = 14 + node.size;
+        if (node.type === 'project') size += 10;
+
         cloudItem.style.fontSize = `${size}px`;
 
-        // Set random position
+        // Set initial position
         cloudItem.style.position = 'absolute';
-        cloudItem.style.left = `${Math.random() * 80 + 10}%`;
-        cloudItem.style.top = `${Math.random() * 80 + 10}%`;
+        cloudItem.style.left = `${Math.random() * 70 + 15}%`;
+        cloudItem.style.top = `${Math.random() * 70 + 15}%`;
+
+        // Set initial velocity for animation
+        cloudItem.dataset.vx = (Math.random() - 0.5) * 2;
+        cloudItem.dataset.vy = (Math.random() - 0.5) * 2;
 
         // Add click event to show details
-        cloudItem.addEventListener('click', () => showNodeDetailsById(node.id));
+        cloudItem.addEventListener('click', () => {
+            showNodeDetailsById(node.id);
+            highlightConnectionsInCloud(node.id);
+        });
 
-        cloudContainer.appendChild(cloudItem);
+        cloudInner.appendChild(cloudItem);
+    });
+
+    // Start cloud animation
+    animateCloud();
+}
+
+function animateCloud() {
+    const cloudItems = document.querySelectorAll('.cloud-item');
+    const container = document.getElementById('cloud-container');
+    const containerRect = container.getBoundingClientRect();
+
+    function updatePositions() {
+        cloudItems.forEach(item => {
+            let left = parseFloat(item.style.left);
+            let top = parseFloat(item.style.top);
+            let vx = parseFloat(item.dataset.vx);
+            let vy = parseFloat(item.dataset.vy);
+
+            // Update position
+            left += vx * 0.1;
+            top += vy * 0.1;
+
+            // Bounce off edges
+            if (left < 10 || left > 90) {
+                vx = -vx;
+                left = Math.max(10, Math.min(90, left));
+            }
+            if (top < 10 || top > 90) {
+                vy = -vy;
+                top = Math.max(10, Math.min(90, top));
+            }
+
+            // Apply magnetic effect to nearby items
+            cloudItems.forEach(otherItem => {
+                if (item === otherItem) return;
+
+                const otherLeft = parseFloat(otherItem.style.left);
+                const otherTop = parseFloat(otherItem.style.top);
+
+                const dx = otherLeft - left;
+                const dy = otherTop - top;
+                const distance = Math.sqrt(dx * dx + dy * dy);
+
+                if (distance < 20) {
+                    const force = (20 - distance) * 0.01;
+                    vx -= dx * force;
+                    vy -= dy * force;
+                }
+            });
+
+            // Apply velocity limits
+            vx = Math.max(-2, Math.min(2, vx));
+            vy = Math.max(-2, Math.min(2, vy));
+
+            // Update item position and data
+            item.style.left = `${left}%`;
+            item.style.top = `${top}%`;
+            item.dataset.vx = vx;
+            item.dataset.vy = vy;
+        });
+
+        requestAnimationFrame(updatePositions);
+    }
+
+    updatePositions();
+}
+
+function highlightConnectionsInCloud(nodeId) {
+    // Find connected node IDs
+    const connectedIds = new Set();
+    links.forEach(link => {
+        if (link.source.id === nodeId) connectedIds.add(link.target.id);
+        if (link.target.id === nodeId) connectedIds.add(link.source.id);
+    });
+
+    // Remove previous highlights
+    document.querySelectorAll('.cloud-item').forEach(item => {
+        item.style.textShadow = '0 0 10px currentColor';
+        item.style.transform = '';
+    });
+
+    // Highlight connected nodes
+    document.querySelectorAll('.cloud-item').forEach(item => {
+        const id = item.dataset.id;
+
+        if (id === nodeId) {
+            item.style.textShadow = '0 0 20px currentColor';
+            item.style.transform = 'scale(1.5)';
+        } else if (connectedIds.has(id)) {
+            item.style.textShadow = '0 0 15px currentColor';
+            item.style.transform = 'scale(1.2)';
+        }
     });
 }
 
@@ -652,6 +1086,109 @@ function toggleTheme() {
 
     // Save preference to localStorage
     localStorage.setItem('persistence-theme', themeLink.disabled ? 'default' : 'cyberpunk');
+}
+
+// Sound effects
+let soundEnabled = false;
+let audioContext = null;
+
+function toggleSound() {
+    soundEnabled = !soundEnabled;
+    const btn = document.getElementById('btn-sound');
+    btn.textContent = soundEnabled ? '🔊' : '🔇';
+
+    if (soundEnabled && !audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    }
+
+    // Save preference
+    localStorage.setItem('persistence-sound', soundEnabled);
+}
+
+function playSound(frequency, duration) {
+    if (!soundEnabled || !audioContext) return;
+
+    const oscillator = audioContext.createOscillator();
+    const gainNode = audioContext.createGain();
+
+    oscillator.type = 'sine';
+    oscillator.frequency.setValueAtTime(frequency, audioContext.currentTime);
+
+    gainNode.gain.setValueAtTime(0.1, audioContext.currentTime);
+    gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + duration);
+
+    oscillator.connect(gainNode);
+    gainNode.connect(audioContext.destination);
+
+    oscillator.start();
+    oscillator.stop(audioContext.currentTime + duration);
+}
+
+// VR Mode
+let vrMode = false;
+let vrRenderer = null;
+
+function toggleVRMode() {
+    vrMode = !vrMode;
+    const btn = document.getElementById('btn-vr');
+
+    if (vrMode) {
+        btn.textContent = '🥽 ON';
+        enableVRMode();
+    } else {
+        btn.textContent = '🥽';
+        disableVRMode();
+    }
+}
+
+function enableVRMode() {
+    if (navigator.xr) {
+        navigator.xr.requestSession('immersive-vr')
+            .then(session => {
+                // Set up VR renderer
+                renderer.xr.enabled = true;
+                renderer.xr.setSession(session);
+            })
+            .catch(err => {
+                console.error('VR not supported:', err);
+                alert('VR mode not supported in this browser');
+                vrMode = false;
+                document.getElementById('btn-vr').textContent = '🥽';
+            });
+    } else {
+        alert('WebXR not supported in this browser');
+        vrMode = false;
+        document.getElementById('btn-vr').textContent = '🥽';
+    }
+}
+
+function disableVRMode() {
+    if (renderer && renderer.xr.enabled) {
+        renderer.xr.enabled = false;
+    }
+}
+
+// Fullscreen
+function toggleFullscreen() {
+    const doc = document.documentElement;
+
+    if (!document.fullscreenElement) {
+        if (doc.requestFullscreen) {
+            doc.requestFullscreen();
+        } else if (doc.webkitRequestFullscreen) { /* Safari */
+            doc.webkitRequestFullscreen();
+        } else if (doc.msRequestFullscreen) { /* IE11 */
+            doc.msRequestFullscreen();
+        }
+    } else {
+        if (document.exitFullscreen) {
+            document.exitFullscreen();
+        } else if (document.webkitExitFullscreen) { /* Safari */
+            document.webkitExitFullscreen();
+        } else if (document.msExitFullscreen) { /* IE11 */
+            document.msExitFullscreen();
+        }
+    }
 }
 
 // Reset view
@@ -763,10 +1300,45 @@ function showNodeDetails(event) {
 
                 // Highlight connected nodes
                 highlightConnectedNodes(nodeId);
+
+                // Tunnel zoom effect
+                tunnelZoom(intersects[i].object.position);
                 break;
             }
         }
     }
+}
+
+// Tunnel zoom effect on node click
+function tunnelZoom(targetPosition) {
+    const startPosition = camera.position.clone();
+    const endPosition = new THREE.Vector3(
+        targetPosition.x,
+        targetPosition.y,
+        targetPosition.z + 20
+    );
+
+    const duration = 1500; // 1.5 seconds
+    const startTime = Date.now();
+
+    function zoomAnimation() {
+        const elapsed = Date.now() - startTime;
+        const progress = Math.min(elapsed / duration, 1);
+
+        // Ease in-out function
+        const easeInOut = progress < 0.5
+            ? 2 * progress * progress
+            : 2 * progress * (2 - progress) - 1;
+
+        camera.position.lerpVectors(startPosition, endPosition, easeInOut);
+        camera.lookAt(targetPosition);
+
+        if (progress < 1) {
+            requestAnimationFrame(zoomAnimation);
+        }
+    }
+
+    zoomAnimation();
 }
 
 // Highlight connected nodes
