@@ -245,6 +245,8 @@ async function rSnapshot(sessionID, messageID, snapshotData) { await mutex(() =>
 async function rPatch(sessionID, messageID, hash, files) { await mutex(() => { stmts.iPatch.run(sessionID, messageID, hash, JSON.stringify(files)) }) }
 async function rSession(sessionID, agent, model, projectDir) { await mutex(() => { stmts.iSession.run(sessionID, new Date().toISOString(), agent || null, model?.providerID || null, model?.modelID || null, projectDir || null) }) }
 async function rCloseSession(sessionID, status) { await mutex(() => { stmts.uCloseSession.run(status, sessionID) }) }
+async function rSessionContext(sessionID, contextType, content) { await mutex(() => { stmts.iSessionContext.run(sessionID, contextType, content) }) }
+
 async function rDecision(text) { await mutex(() => { for (const d of extractPatterns(text, RE_DECISIONS)) stmts.uPattern.run("decision", d) }) }
 async function rKnowledge(text, sessionID) { await mutex(() => { for (const f of extractPatterns(text, RE_FACTS)) stmts.upsertKnowledge.run(f, sessionID || null) }) }
 
@@ -441,6 +443,9 @@ export async function PersistencePlugin(input, options = {}) {
 
     "experimental.session.compacting": async (input, output) => {
       output.context.push("[PERSISTENCE v4.1] Preserve: (1) decisions+reasons (2) errors+causes (3) nextSteps+priority (4) file paths+configs+architecture (5) user preferences (6) tools+results (7) files modified+changes (8) model+agent config.")
+
+      // Save compacting context to memory_context
+      await rSessionContext(input.sessionID, 'compact', output.context.join('\n'))
       await flush()
     },
 
@@ -466,6 +471,12 @@ export async function PersistencePlugin(input, options = {}) {
           const info = event.properties?.info
           if (info?.role === "assistant" && info.time?.completed && info.error)
             await rSessionError(info.sessionID, info.error.name, info.error.data?.message || "Unknown")
+
+          // Save assistant reply if available
+          if (info?.role === "assistant" && info.text) {
+            await rReply(info.text, null, info.sessionID, info.id, info.model, info.agent)
+            await flush()
+          }
           break
         }
         case "message.part.updated": {
