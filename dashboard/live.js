@@ -27,76 +27,93 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Handle window resize
     window.addEventListener('resize', () => {
-        camera.aspect = document.getElementById('three-container').clientWidth / document.getElementById('three-container').clientHeight;
+        if (!scene || !camera || !renderer) return;
+
+        const container = document.getElementById('three-container');
+        if (!container) return;
+
+        const width = container.clientWidth;
+        const height = container.clientHeight;
+
+        camera.aspect = width / height;
         camera.updateProjectionMatrix();
-        renderer.setSize(document.getElementById('three-container').clientWidth, document.getElementById('three-container').clientHeight);
+        renderer.setSize(width, height);
     });
 });
 
 // Three.js initialization for 3D visualization
 function initThreeJS() {
     const container = document.getElementById('three-container');
-    const width = container.clientWidth;
-    const height = container.clientHeight;
+    if (!container) {
+        console.error('three-container element not found');
+        return;
+    }
 
-    // Create scene
-    scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0a0a12);
-    scene.fog = new THREE.FogExp2(0x0a0a12, 0.05);
+    const width = container.clientWidth || 800;
+    const height = container.clientHeight || 600;
 
-    // Create camera
-    camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
-    camera.position.z = 50;
+    try {
+        // Create scene
+        scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0a12);
+        scene.fog = new THREE.FogExp2(0x0a0a12, 0.05);
 
-    // Create renderer
-    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-    renderer.setSize(width, height);
-    renderer.setPixelRatio(window.devicePixelRatio);
-    container.appendChild(renderer.domElement);
+        // Create camera
+        camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+        camera.position.z = 50;
 
-    // Add ambient light
-    const ambientLight = new THREE.AmbientLight(0x404040, 2);
-    scene.add(ambientLight);
+        // Create renderer
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.appendChild(renderer.domElement);
 
-    // Add directional light
-    const directionalLight = new THREE.DirectionalLight(0x00f0ff, 1);
-    directionalLight.position.set(1, 1, 1);
-    scene.add(directionalLight);
+        // Add ambient light
+        const ambientLight = new THREE.AmbientLight(0x404040, 2);
+        scene.add(ambientLight);
 
-    // Add point lights for each color
-    const colors = [0x00f0ff, 0x00ff88, 0x8866ff, 0xff3366, 0xffaa00];
-    colors.forEach((color, i) => {
-        const light = new THREE.PointLight(color, 1, 100);
-        light.position.set(
-            Math.cos(i * Math.PI * 2 / colors.length) * 30,
-            Math.sin(i * Math.PI * 2 / colors.length) * 30,
-            0
-        );
-        scene.add(light);
-    });
+        // Add directional light
+        const directionalLight = new THREE.DirectionalLight(0x00f0ff, 1);
+        directionalLight.position.set(1, 1, 1);
+        scene.add(directionalLight);
 
-    // Add particles background
-    createParticleBackground();
+        // Add point lights for each color
+        const colors = [0x00f0ff, 0x00ff88, 0x8866ff, 0xff3366, 0xffaa00];
+        colors.forEach((color, i) => {
+            const light = new THREE.PointLight(color, 1, 100);
+            light.position.set(
+                Math.cos(i * Math.PI * 2 / colors.length) * 30,
+                Math.sin(i * Math.PI * 2 / colors.length) * 30,
+                0
+            );
+            scene.add(light);
+        });
 
-    // Add controls
-    controls = new THREE.OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
-    controls.screenSpacePanning = false;
-    controls.minDistance = 10;
-    controls.maxDistance = 200;
+        // Add particles background
+        createParticleBackground();
 
-    // Add fog for depth perception
-    scene.fog = new THREE.FogExp2(0x0a0a12, 0.025);
+        // Add controls
+        controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.screenSpacePanning = false;
+        controls.minDistance = 10;
+        controls.maxDistance = 200;
 
-    // Add starfield background
-    createStarfield();
+        // Add fog for depth perception
+        scene.fog = new THREE.FogExp2(0x0a0a12, 0.025);
 
-    // Add physics simulation for nodes
-    initNodePhysics();
+        // Add starfield background
+        createStarfield();
 
-    // Animation loop
-    animate();
+        // Add physics simulation for nodes
+        initNodePhysics();
+
+        // Animation loop
+        animate();
+    } catch (e) {
+        console.error('Error initializing Three.js:', e);
+    }
 }
 
 // Node physics simulation
@@ -206,10 +223,17 @@ function createParticleBackground() {
 
 // Animation loop
 function animate() {
+    if (!scene || !camera || !renderer) {
+        requestAnimationFrame(animate);
+        return;
+    }
+
     requestAnimationFrame(animate);
 
-    // Update controls
-    controls.update();
+    // Update controls if available
+    if (controls) {
+        controls.update();
+    }
 
     // Rotate data cube
     const cube = document.querySelector('.logo-cube');
@@ -240,6 +264,11 @@ function animate() {
 
 // Create 3D nodes from data
 function create3DNodes() {
+    if (!scene || !renderer) {
+        console.error('Three.js not initialized');
+        return;
+    }
+
     // Clear existing nodes
     threeNodes.forEach((node3d, id) => {
         scene.remove(node3d);
