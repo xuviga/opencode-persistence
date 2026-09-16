@@ -195,7 +195,7 @@ function updateGraph(data) {
         .on('click', showNodeDetails);
 
     // Update simulation with new data
-    updateSimulation();
+    updateSimulation(link, node);
 }
 
 function getLinkColor(type) {
@@ -297,7 +297,6 @@ function loadStats() {
             document.getElementById('stat-sessions').textContent = data.sessions || 0;
             document.getElementById('stat-actions').textContent = data.actions || 0;
             document.getElementById('stat-errors').textContent = data.errors || 0;
-            document.getElementById('stat-files').textContent = data.files || 0;
         });
 }
 
@@ -371,7 +370,7 @@ function dragended(event, d) {
 }
 
 // Update minimap after simulation tick
-function updateSimulation() {
+function updateSimulation(link, node) {
     simulation.nodes(nodes).on('tick', () => {
         link
             .attr('x1', d => d.source.x)
