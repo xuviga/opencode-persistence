@@ -6,107 +6,38 @@
     <title>XuViGaN Persistence Dashboard</title>
     <link rel="stylesheet" href="style.css">
     <script src="https://d3js.org/d3.v7.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.min.js"></script>
 </head>
 <body>
     <div id="app">
         <header>
-            <div class="logo-container">
-                <div class="logo-cube"></div>
-                <h1>XuViGaN <span class="neon">PERSISTENCE</span></h1>
-            </div>
+            <h1>XuViGaN <span class="neon">PERSISTENCE</span></h1>
 
-            <div class="header-center">
-                <!-- 3D Data Visualization -->
-                <div id="data-cube-container">
-                    <div class="cube-face front">Projects</div>
-                    <div class="cube-face back">Sessions</div>
-                    <div class="cube-face right">Actions</div>
-                    <div class="cube-face left">Errors</div>
-                    <div class="cube-face top">Files</div>
-                    <div class="cube-face bottom">Live</div>
-                </div>
-
-                <div id="hologram-stats">
-                    <div class="holo-stat">
-                        <div class="holo-value" id="stat-projects">0</div>
-                        <div class="holo-label">Projects</div>
-                    </div>
-                    <div class="holo-stat">
-                        <div class="holo-value" id="stat-sessions">0</div>
-                        <div class="holo-label">Sessions</div>
-                    </div>
-                    <div class="holo-stat">
-                        <div class="holo-value" id="stat-actions">0</div>
-                        <div class="holo-label">Actions</div>
-                    </div>
-                    <div class="holo-stat">
-                        <div class="holo-value" id="stat-errors">0</div>
-                        <div class="holo-label">Errors</div>
-                    </div>
-                    <div class="holo-stat live">
-                        <div class="holo-pulse"></div>
-                        <div class="holo-label">LIVE</div>
-                    </div>
-                </div>
+            <!-- Stats -->
+            <div id="stats">
+                <div class="stat"><span class="label">Projects</span><span class="value" id="stat-projects">0</span></div>
+                <div class="stat"><span class="label">Sessions</span><span class="value" id="stat-sessions">0</span></div>
+                <div class="stat"><span class="label">Actions</span><span class="value" id="stat-actions">0</span></div>
+                <div class="stat"><span class="label">Errors</span><span class="value" id="stat-errors">0</span></div>
+                <div class="stat live"><span class="pulse"></span> LIVE</div>
             </div>
 
             <!-- Controls -->
             <div id="controls">
                 <button id="btn-export-png" title="Export PNG">📸</button>
                 <button id="btn-export-json" title="Export JSON">💾</button>
-                <button id="btn-theme" title="Toggle Theme">🎨</button>
-                <button id="btn-sound" title="Toggle Sound">🔊</button>
-                <button id="btn-vr" title="Toggle VR Mode">🥽</button>
-                <button id="btn-fullscreen" title="Toggle Fullscreen">⛶</button>
+                <button id="btn-reset" title="Reset View">⟲</button>
             </div>
         </header>
 
-        <!-- Adaptive Interface - changes based on data -->
-        <div id="adaptive-interface">
-            <div id="interface-selector">
-                <button class="interface-btn active" data-interface="graph">3D Graph</button>
-                <button class="interface-btn" data-interface="matrix">Matrix</button>
-                <button class="interface-btn" data-interface="wave">Wave</button>
-                <button class="interface-btn" data-interface="cloud">Cloud</button>
-            </div>
-
-            <div id="search-container">
-                <input type="text" id="search-box" placeholder="🔍 Search nodes..." />
-                <button id="btn-reset" title="Reset View">⟲</button>
-            </div>
+        <!-- Search Bar -->
+        <div id="search-container">
+            <input type="text" id="search-box" placeholder="🔍 Search nodes..." />
         </div>
 
         <main>
-            <div id="visualization-container">
-                <!-- 3D Graph View -->
-                <div id="graph-view" class="visualization active">
-                    <div id="three-container"></div>
-                    <div id="graph-overlay"></div>
-                    <div id="tooltip"></div>
-
-                    <!-- Minimap -->
-                    <div id="minimap-container">
-                        <svg id="minimap"></svg>
-                        <div id="minimap-viewport"></div>
-                    </div>
-                </div>
-
-                <!-- Matrix View -->
-                <div id="matrix-view" class="visualization">
-                    <div id="matrix-grid"></div>
-                </div>
-
-                <!-- Wave View -->
-                <div id="wave-view" class="visualization">
-                    <canvas id="wave-canvas"></canvas>
-                </div>
-
-                <!-- Cloud View -->
-                <div id="cloud-view" class="visualization">
-                    <div id="cloud-container"></div>
-                </div>
+            <div id="graph-container">
+                <svg id="graph"></svg>
+                <div id="tooltip"></div>
             </div>
 
             <div id="sidebar">
@@ -123,9 +54,6 @@
             </div>
         </main>
     </div>
-
-    <!-- Theme stylesheets (lazy loaded) -->
-    <link id="theme-stylesheet" rel="stylesheet" href="themes/cyberpunk.css" disabled>
 
     <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
     <script src="live.js"></script>
