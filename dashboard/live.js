@@ -177,107 +177,67 @@ function updateGraph(data) {
             .on('drag', dragged)
             .on('end', dragended));
 
-    // Create unique shapes based on node type
+    // Create neural network style nodes
     nodeEnter.each(function(d) {
         const g = d3.select(this);
 
-        // Add glow effect
+        // Create neural aura
         g.append('circle')
-            .attr('r', d => d.size * 1.5)
+            .attr('r', d => d.size * 2)
             .attr('fill', 'none')
             .attr('stroke', d => d.color)
-            .attr('stroke-width', 1)
-            .attr('opacity', 0.3)
-            .attr('filter', 'url(#glow)');
+            .attr('stroke-width', 0.5)
+            .attr('opacity', 0.1)
+            .attr('filter', 'url(#glow)')
+            .attr('class', 'neural-aura');
 
-        // Add main shape based on type
-        if (d.type === 'project') {
-            // Hexagon for projects
-            const points = hexagonPoints(d.size);
-            g.append('polygon')
-                .attr('points', points)
-                .attr('fill', d => d.color)
-                .attr('stroke', '#fff')
-                .attr('stroke-width', 1.5)
-                .attr('opacity', 0.9);
-        } else if (d.type === 'session') {
-            // Rounded square for sessions
-            g.append('rect')
-                .attr('x', -d.size)
-                .attr('y', -d.size)
-                .attr('width', d.size * 2)
-                .attr('height', d.size * 2)
-                .attr('rx', d.size * 0.3)
-                .attr('ry', d.size * 0.3)
-                .attr('fill', d => d.color)
-                .attr('stroke', '#fff')
-                .attr('stroke-width', 1.5)
-                .attr('opacity', 0.9);
-        } else if (d.type === 'error') {
-            // Diamond for errors
-            g.append('path')
-                .attr('d', `M 0 ${-d.size} L ${d.size} 0 L 0 ${d.size} L ${-d.size} 0 Z`)
-                .attr('fill', d => d.color)
-                .attr('stroke', '#fff')
-                .attr('stroke-width', 1.5)
-                .attr('opacity', 0.9);
-        } else if (d.type === 'file') {
-            // Document shape for files
-            g.append('path')
-                .attr('d', `M ${-d.size*0.7} ${-d.size}
-                           L ${d.size*0.7} ${-d.size}
-                           L ${d.size*0.7} ${d.size*0.3}
-                           L ${d.size*0.3} ${d.size}
-                           L ${-d.size*0.7} ${d.size} Z
-                           M ${d.size*0.7} ${-d.size}
-                           L ${d.size*0.3} ${-d.size*0.3}
-                           L ${d.size*0.7} ${-d.size*0.3}`)
-                .attr('fill', d => d.color)
-                .attr('stroke', '#fff')
-                .attr('stroke-width', 1.5)
-                .attr('opacity', 0.9);
-        } else {
-            // Circle for actions and other types
-            g.append('circle')
-                .attr('r', d => d.size)
-                .attr('fill', d => d.color)
-                .attr('stroke', '#fff')
-                .attr('stroke-width', 1.5)
-                .attr('opacity', 0.9);
+        // Create neural connections (dendrites)
+        if (d.type === 'project' || d.type === 'session') {
+            const dendriteCount = d.type === 'project' ? 8 : 5;
+            for (let i = 0; i < dendriteCount; i++) {
+                const angle = (Math.PI * 2 / dendriteCount) * i;
+                const length = d.size * 0.7;
+                const x2 = Math.cos(angle) * length;
+                const y2 = Math.sin(angle) * length;
+
+                g.append('path')
+                    .attr('d', `M 0 0 Q ${x2 * 0.5} ${y2 * 0.5 + (Math.random() * 10 - 5)} ${x2} ${y2}`)
+                    .attr('stroke', d.color)
+                    .attr('stroke-width', 1)
+                    .attr('opacity', 0.4)
+                    .attr('fill', 'none')
+                    .attr('class', 'neural-dendrite');
+            }
         }
 
-        // Add inner detail for depth
-        if (d.type === 'project') {
-            const innerPoints = hexagonPoints(d.size * 0.6);
-            g.append('polygon')
-                .attr('points', innerPoints)
-                .attr('fill', 'rgba(255,255,255,0.2)')
-                .attr('stroke', 'rgba(255,255,255,0.5)')
-                .attr('stroke-width', 0.5);
-        } else if (d.type === 'session') {
-            g.append('rect')
-                .attr('x', -d.size * 0.6)
-                .attr('y', -d.size * 0.6)
-                .attr('width', d.size * 1.2)
-                .attr('height', d.size * 1.2)
-                .attr('rx', d.size * 0.2)
-                .attr('ry', d.size * 0.2)
-                .attr('fill', 'rgba(255,255,255,0.2)')
-                .attr('stroke', 'rgba(255,255,255,0.5)')
-                .attr('stroke-width', 0.5);
-        } else {
+        // Create main node body with morphing shape
+        const morphPath = getMorphPath(d.type, d.size);
+        g.append('path')
+            .attr('d', morphPath)
+            .attr('fill', d => d.color)
+            .attr('stroke', '#fff')
+            .attr('stroke-width', 1.5)
+            .attr('opacity', 0.9)
+            .attr('class', 'neural-body')
+            .attr('filter', 'url(#glow)');
+
+        // Add inner nucleus
+        if (d.type === 'project' || d.type === 'session') {
             g.append('circle')
-                .attr('r', d => d.size * 0.6)
-                .attr('fill', 'rgba(255,255,255,0.2)')
-                .attr('stroke', 'rgba(255,255,255,0.5)')
-                .attr('stroke-width', 0.5);
+                .attr('r', d => d.size * 0.3)
+                .attr('fill', 'rgba(255,255,255,0.8)')
+                .attr('stroke', '#fff')
+                .attr('stroke-width', 1)
+                .attr('class', 'neural-nucleus')
+                .attr('data-original-r', d => d.size * 0.3);
         }
     });
 
     nodeEnter.append('text')
-        .attr('dy', d => d.size + 15)
+        .attr('dy', d => d.size + 20)
         .text(d => d.label)
-        .attr('font-size', d => Math.max(10, d.size / 2));
+        .attr('font-size', d => Math.max(12, d.size / 1.5))
+        .attr('class', 'neural-label');
 
     node = nodeEnter.merge(node);
 
@@ -288,6 +248,9 @@ function updateGraph(data) {
 
     // Update simulation with new data
     updateSimulation(link, node);
+
+    // Animate neural nodes
+    animateNeuralNodes();
 }
 
 function getLinkColor(type) {
@@ -473,6 +436,46 @@ function hexagonPoints(size) {
     return points.join(' ');
 }
 
+// Neural morphing path generator
+function getMorphPath(type, size) {
+    switch (type) {
+        case 'project':
+            // Complex project shape
+            return `M ${-size} ${-size*0.5}
+                    C ${-size*0.7} ${-size} ${size*0.7} ${-size} ${size} ${-size*0.5}
+                    C ${size} ${size*0.2} ${size*0.5} ${size} 0 ${size}
+                    C ${-size*0.5} ${size} ${-size} ${size*0.2} ${-size} ${-size*0.5} Z`;
+        case 'session':
+            // Flowing session shape
+            return `M 0 ${-size}
+                    C ${size*0.8} ${-size*0.5} ${size*0.8} ${size*0.5} 0 ${size}
+                    C ${-size*0.8} ${size*0.5} ${-size*0.8} ${-size*0.5} 0 ${-size} Z`;
+        case 'error':
+            // Sharp error shape
+            return `M 0 ${-size}
+                    L ${size*0.8} 0
+                    L 0 ${size}
+                    L ${-size*0.8} 0 Z`;
+        case 'file':
+            // Document-like file shape
+            return `M ${-size*0.6} ${-size}
+                    L ${size*0.6} ${-size}
+                    L ${size*0.6} ${size*0.4}
+                    L ${size*0.4} ${size*0.6}
+                    L ${-size*0.6} ${size*0.6} Z
+                    M ${size*0.6} ${-size}
+                    L ${size*0.4} ${-size*0.4}
+                    L ${size*0.6} ${-size*0.4}`;
+        default:
+            // Organic action shape
+            return `M 0 ${-size}
+                    C ${size*0.5} ${-size*0.8} ${size*0.8} ${-size*0.5} ${size} 0
+                    C ${size*0.8} ${size*0.5} ${size*0.5} ${size*0.8} 0 ${size}
+                    C ${-size*0.5} ${size*0.8} ${-size*0.8} ${size*0.5} ${-size} 0
+                    C ${-size*0.8} ${-size*0.5} ${-size*0.5} ${-size*0.8} 0 ${-size} Z`;
+    }
+}
+
 // Update minimap after simulation tick
 function updateSimulation(link, node) {
     simulation.nodes(nodes).on('tick', () => {
@@ -490,6 +493,53 @@ function updateSimulation(link, node) {
 
     simulation.force('link').links(links);
     simulation.alpha(0.3).restart();
+}
+
+// Neural network animation
+function animateNeuralNodes() {
+    // Animate dendrites
+    d3.selectAll('.neural-dendrite')
+        .transition()
+        .duration(2000 + Math.random() * 3000)
+        .attr('opacity', 0.1)
+        .transition()
+        .duration(2000 + Math.random() * 3000)
+        .attr('opacity', 0.4)
+        .on('end', function() {
+            // Restart animation
+            d3.select(this).transition().duration(100).on('end', animateNeuralNodes);
+        });
+
+    // Animate node bodies
+    d3.selectAll('.neural-body')
+        .transition()
+        .duration(3000 + Math.random() * 2000)
+        .attr('opacity', 0.7)
+        .transition()
+        .duration(3000 + Math.random() * 2000)
+        .attr('opacity', 0.9)
+        .on('end', function() {
+            // Restart animation
+            d3.select(this).transition().duration(100).on('end', animateNeuralNodes);
+        });
+
+    // Animate nuclei
+    d3.selectAll('.neural-nucleus')
+        .transition()
+        .duration(1500 + Math.random() * 1000)
+        .attr('r', function() {
+            const original = parseFloat(d3.select(this).attr('data-original-r'));
+            return original * 0.8;
+        })
+        .transition()
+        .duration(1500 + Math.random() * 1000)
+        .attr('r', function() {
+            return d3.select(this).attr('data-original-r');
+        })
+        .on('end', function() {
+            // Restart animation
+            d3.select(this).transition().duration(100).on('end', animateNeuralNodes);
+        });
 }
 
 // Particles effect
