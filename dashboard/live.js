@@ -7,30 +7,32 @@ let svg, width, height;
 let nodes = [], links = [];
 
 // Initialize
-document.addEventListener('DOMContentLoaded', () => {
-    // Load saved theme
-    const savedTheme = localStorage.getItem('persistence-theme');
-    if (savedTheme === 'cyberpunk') {
-        document.getElementById('theme-stylesheet').disabled = false;
-    }
+    document.addEventListener('DOMContentLoaded', () => {
+        // Load saved theme
+        const savedTheme = localStorage.getItem('persistence-theme');
+        if (savedTheme === 'cyberpunk') {
+            document.getElementById('theme-stylesheet').disabled = false;
+        }
 
-    initGraph();
-    connectWebSocket();
-    loadStats();
-    initSparkline();
-    initFilters();
-    initMinimap();
-    initControls();
+        initGraph();
+        connectWebSocket();
+        loadStats();
+        initSparkline();
+        initFilters();
+        initMinimap();
+        initControls();
+        initParticles();
 
-    // Handle window resize
-    window.addEventListener('resize', () => {
-        width = document.getElementById('graph-container').clientWidth;
-        height = document.getElementById('graph-container').clientHeight;
-        simulation.force('center', d3.forceCenter(width / 2, height / 2));
-        simulation.alpha(0.3).restart();
-        updateMinimap();
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            width = document.getElementById('graph-container').clientWidth;
+            height = document.getElementById('graph-container').clientHeight;
+            simulation.force('center', d3.forceCenter(width / 2, height / 2));
+            simulation.alpha(0.3).restart();
+            updateMinimap();
+            resizeParticles();
+        });
     });
-});
 
 function initGraph() {
     svg = d3.select('#graph');
@@ -175,17 +177,107 @@ function updateGraph(data) {
             .on('drag', dragged)
             .on('end', dragended));
 
-    nodeEnter.append('circle')
-        .attr('r', d => d.size)
-        .attr('fill', d => d.color)
-        .attr('filter', 'url(#glow)')
-        .attr('stroke', d => d.color)
-        .attr('stroke-width', 1.5)
-        .attr('stroke-opacity', 0.5);
+    // Create unique shapes based on node type
+    nodeEnter.each(function(d) {
+        const g = d3.select(this);
+
+        // Add glow effect
+        g.append('circle')
+            .attr('r', d => d.size * 1.5)
+            .attr('fill', 'none')
+            .attr('stroke', d => d.color)
+            .attr('stroke-width', 1)
+            .attr('opacity', 0.3)
+            .attr('filter', 'url(#glow)');
+
+        // Add main shape based on type
+        if (d.type === 'project') {
+            // Hexagon for projects
+            const points = hexagonPoints(d.size);
+            g.append('polygon')
+                .attr('points', points)
+                .attr('fill', d => d.color)
+                .attr('stroke', '#fff')
+                .attr('stroke-width', 1.5)
+                .attr('opacity', 0.9);
+        } else if (d.type === 'session') {
+            // Rounded square for sessions
+            g.append('rect')
+                .attr('x', -d.size)
+                .attr('y', -d.size)
+                .attr('width', d.size * 2)
+                .attr('height', d.size * 2)
+                .attr('rx', d.size * 0.3)
+                .attr('ry', d.size * 0.3)
+                .attr('fill', d => d.color)
+                .attr('stroke', '#fff')
+                .attr('stroke-width', 1.5)
+                .attr('opacity', 0.9);
+        } else if (d.type === 'error') {
+            // Diamond for errors
+            g.append('path')
+                .attr('d', `M 0 ${-d.size} L ${d.size} 0 L 0 ${d.size} L ${-d.size} 0 Z`)
+                .attr('fill', d => d.color)
+                .attr('stroke', '#fff')
+                .attr('stroke-width', 1.5)
+                .attr('opacity', 0.9);
+        } else if (d.type === 'file') {
+            // Document shape for files
+            g.append('path')
+                .attr('d', `M ${-d.size*0.7} ${-d.size}
+                           L ${d.size*0.7} ${-d.size}
+                           L ${d.size*0.7} ${d.size*0.3}
+                           L ${d.size*0.3} ${d.size}
+                           L ${-d.size*0.7} ${d.size} Z
+                           M ${d.size*0.7} ${-d.size}
+                           L ${d.size*0.3} ${-d.size*0.3}
+                           L ${d.size*0.7} ${-d.size*0.3}`)
+                .attr('fill', d => d.color)
+                .attr('stroke', '#fff')
+                .attr('stroke-width', 1.5)
+                .attr('opacity', 0.9);
+        } else {
+            // Circle for actions and other types
+            g.append('circle')
+                .attr('r', d => d.size)
+                .attr('fill', d => d.color)
+                .attr('stroke', '#fff')
+                .attr('stroke-width', 1.5)
+                .attr('opacity', 0.9);
+        }
+
+        // Add inner detail for depth
+        if (d.type === 'project') {
+            const innerPoints = hexagonPoints(d.size * 0.6);
+            g.append('polygon')
+                .attr('points', innerPoints)
+                .attr('fill', 'rgba(255,255,255,0.2)')
+                .attr('stroke', 'rgba(255,255,255,0.5)')
+                .attr('stroke-width', 0.5);
+        } else if (d.type === 'session') {
+            g.append('rect')
+                .attr('x', -d.size * 0.6)
+                .attr('y', -d.size * 0.6)
+                .attr('width', d.size * 1.2)
+                .attr('height', d.size * 1.2)
+                .attr('rx', d.size * 0.2)
+                .attr('ry', d.size * 0.2)
+                .attr('fill', 'rgba(255,255,255,0.2)')
+                .attr('stroke', 'rgba(255,255,255,0.5)')
+                .attr('stroke-width', 0.5);
+        } else {
+            g.append('circle')
+                .attr('r', d => d.size * 0.6)
+                .attr('fill', 'rgba(255,255,255,0.2)')
+                .attr('stroke', 'rgba(255,255,255,0.5)')
+                .attr('stroke-width', 0.5);
+        }
+    });
 
     nodeEnter.append('text')
-        .attr('dy', d => d.size + 12)
-        .text(d => d.label);
+        .attr('dy', d => d.size + 15)
+        .text(d => d.label)
+        .attr('font-size', d => Math.max(10, d.size / 2));
 
     node = nodeEnter.merge(node);
 
@@ -369,6 +461,18 @@ function dragended(event, d) {
     d.fy = null;
 }
 
+// Utility function to create hexagon points
+function hexagonPoints(size) {
+    const points = [];
+    for (let i = 0; i < 6; i++) {
+        const angle = (Math.PI / 3) * i;
+        const x = size * Math.cos(angle);
+        const y = size * Math.sin(angle);
+        points.push(`${x},${y}`);
+    }
+    return points.join(' ');
+}
+
 // Update minimap after simulation tick
 function updateSimulation(link, node) {
     simulation.nodes(nodes).on('tick', () => {
@@ -386,6 +490,75 @@ function updateSimulation(link, node) {
 
     simulation.force('link').links(links);
     simulation.alpha(0.3).restart();
+}
+
+// Particles effect
+let particlesCanvas, particlesCtx, particles = [];
+
+function initParticles() {
+    particlesCanvas = document.getElementById('particles');
+    particlesCtx = particlesCanvas.getContext('2d');
+    resizeParticles();
+
+    // Create particles
+    const particleCount = Math.floor((width * height) / 10000);
+    for (let i = 0; i < particleCount; i++) {
+        particles.push({
+            x: Math.random() * width,
+            y: Math.random() * height,
+            radius: Math.random() * 1.5 + 0.5,
+            color: `rgba(0, 240, 255, ${Math.random() * 0.3 + 0.1})`,
+            speedX: (Math.random() - 0.5) * 0.5,
+            speedY: (Math.random() - 0.5) * 0.5,
+            angle: Math.random() * Math.PI * 2,
+            rotationSpeed: (Math.random() - 0.5) * 0.02
+        });
+    }
+
+    animateParticles();
+}
+
+function resizeParticles() {
+    particlesCanvas.width = width;
+    particlesCanvas.height = height;
+}
+
+function animateParticles() {
+    particlesCtx.clearRect(0, 0, width, height);
+
+    particles.forEach(p => {
+        // Update position
+        p.x += p.speedX;
+        p.y += p.speedY;
+
+        // Bounce off edges
+        if (p.x < 0 || p.x > width) p.speedX *= -1;
+        if (p.y < 0 || p.y > height) p.speedY *= -1;
+
+        // Draw particle
+        particlesCtx.beginPath();
+        particlesCtx.arc(p.x, p.y, p.radius, 0, Math.PI * 2);
+        particlesCtx.fillStyle = p.color;
+        particlesCtx.fill();
+
+        // Draw connecting lines between nearby particles
+        particles.forEach(p2 => {
+            const dx = p.x - p2.x;
+            const dy = p.y - p2.y;
+            const distance = Math.sqrt(dx * dx + dy * dy);
+
+            if (distance < 100) {
+                particlesCtx.beginPath();
+                particlesCtx.moveTo(p.x, p.y);
+                particlesCtx.lineTo(p2.x, p2.y);
+                particlesCtx.strokeStyle = `rgba(0, 240, 255, ${0.1 * (1 - distance / 100)})`;
+                particlesCtx.lineWidth = 0.5;
+                particlesCtx.stroke();
+            }
+        });
+    });
+
+    requestAnimationFrame(animateParticles);
 }
 
 // Sparkline functionality
