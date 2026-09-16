@@ -4,6 +4,7 @@
 const WS_URL = `ws://${window.location.hostname}:${window.location.port}/ws`;
 let ws = null, simulation, svg, width, height;
 let nodes = [], links = [];
+let selectedNodeId = null; // ID выбранного узла
 
 // === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ВЫНЕСЕНЫ НАВЕРХ ===
 function getLinkColor(type) {
@@ -137,6 +138,13 @@ function initGraph() {
 
     svg.call(zoom);
 
+    // Клик по фону сбрасывает выбор
+    svg.on('click', (event) => {
+        if (event.target.tagName === 'svg') {
+            resetSelection();
+        }
+    });
+
     const container = svg.append('g').attr('class', 'container');
 
     defs.append('marker')
@@ -201,10 +209,28 @@ function connectWebSocket() {
 function updateGraph(data) {
     if (!data || !data.nodes) return;
 
+    // Сохраняем старые позиции, чтобы узлы не летели в центр
+    const oldPositions = new Map(nodes.map(n => [n.id, { x: n.x, y: n.y }]));
+
     nodes = data.nodes;
     links = data.links;
 
+    // Сброс выбора при обновлении графа
+    selectedNodeId = null;
+
+    // Восстанавливаем старые позиции, если они есть
+    nodes.forEach(n => {
+        const oldPos = oldPositions.get(n.id);
+        if (oldPos) {
+            n.x = oldPos.x;
+            n.y = oldPos.y;
+            n.fx = null; n.fy = null;
+        }
+    });
+
     const container = svg.select('.container');
+
+    // ... остальная часть без изменений
 
     let link = container.selectAll('.link')
         .data(links, d => `${d.source.id || d.source}-${d.target.id || d.target}`);
@@ -257,6 +283,22 @@ function updateGraph(data) {
 }
 
 // === ОСТАЛЬНОЕ ПОДКЛЮЧАЕТСЯ В КОНЦЕ ===
+function resetSelection() {
+    selectedNodeId = null;
+    nodes.forEach(n => { n.fx = null; n.fy = null; });
+    simulation.alpha(0.3).restart();
+
+    svg.selectAll('.node')
+        .classed('dimmed', false)
+        .classed('highlighted', false);
+
+    svg.selectAll('.link')
+        .classed('dimmed', false)
+        .classed('highlighted', false);
+
+    document.getElementById('node-info').innerHTML = '<p class="placeholder">Select a node to view details</p>';
+}
+
 function showTooltip(event, d) {
     const tooltip = document.getElementById('tooltip');
     let content = `<div class="tooltip-title">${d.label}</div>`;
@@ -290,6 +332,23 @@ function hideTooltip() {
 }
 
 function showNodeDetails(event, d) {
+    event.stopPropagation();
+
+    // Если уже выбран этот узел — сброс
+    if (selectedNodeId === d.id) {
+        resetSelection();
+        return;
+    }
+
+    selectedNodeId = d.id; // сохраняем id выбранного узла
+
+    // Останавливаем симуляцию и фиксируем все позиции
+    simulation.stop();
+    nodes.forEach(n => {
+        n.fx = n.x;
+        n.fy = n.y;
+    });
+
     const info = document.getElementById('node-info');
     let html = `<span class="type-badge ${d.type}">${d.type}</span>`;
     html += `<h4 style="margin: 8px 0; color: ${d.color}">${d.label}</h4>`;
@@ -425,10 +484,13 @@ function exportJSON() {
 }
 
 function resetView() {
+    // Сброс зума
     svg.transition().duration(750).call(d3.zoom().transform, d3.zoomIdentity);
-    svg.selectAll('.node').classed('dimmed highlighted search-match', false);
-    svg.selectAll('.link').classed('dimmed highlighted', false);
-    document.getElementById('node-info').innerHTML = '<p class="placeholder">Select a node to view details</p>';
+
+    // Сброс выбора узла
+    resetSelection();
+
+    // Сброс поиска
     document.getElementById('search-box').value = '';
 }
 
