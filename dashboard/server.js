@@ -2,22 +2,36 @@
 import { readFileSync, existsSync } from "fs"
 import path from "path"
 
-const PORT = 3457
+// Базовый порт + смещение по sessionID (чтобы не было конфликтов)
+const BASE_PORT = 3457
 const DASHBOARD_DIR = import.meta.dir
 
 let db = null
 let server = null
+let port = BASE_PORT // по умолчанию
 const clients = new Set()
 
-export function init(database) {
+export function init(database, sessionID) {
   db = database
+
+  // Если есть sessionID — вычисляем порт на его основе
+  if (sessionID) {
+    // Берём последние 4 символа ID и преобразуем в число (0–9999)
+    const suffix = parseInt(sessionID.slice(-4), 36) % 1000
+    port = BASE_PORT + suffix
+    console.log(`[Persistence Dashboard] Assigned port ${port} for session ${sessionID}`)
+  }
 }
 
 export function start() {
-  if (server) return
+  if (server) {
+    console.log(`[Persistence Dashboard] Already running on port ${port}`)
+    return
+  }
+
   try {
     server = Bun.serve({
-      port: PORT,
+      port: port,
       fetch(req, srv) {
         const url = new URL(req.url)
 
@@ -45,7 +59,7 @@ export function start() {
           return Response.json(getStats(), { headers })
         }
 
-        // Static
+        // Static files
         let filePath = url.pathname === "/" ? "index.html" : url.pathname.slice(1)
         const fullPath = path.join(DASHBOARD_DIR, filePath)
 
@@ -74,9 +88,16 @@ export function start() {
         message() {}
       }
     })
-    console.log(`[Persistence Dashboard] Live at http://localhost:${PORT}`)
+    console.log(`[Persistence Dashboard] Live at http://localhost:${port}`)
   } catch (e) {
     console.error(`[Persistence Dashboard] Failed to start: ${e.message}`)
+
+    // Если порт занят — пробуем следующий
+    if (e.message.includes("port is already in use")) {
+      console.log(`[Persistence Dashboard] Port ${port} in use, trying next...`)
+      port++
+      start() // Рекурсивно вызываем start с новым портом
+    }
   }
 }
 

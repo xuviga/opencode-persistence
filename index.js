@@ -12,11 +12,15 @@ import os from "os"
 
 // Dashboard module (lazy loaded)
 let dashboard = null
-async function initDashboard(dbInstance) {
+let dashboardStarted = false
+
+async function initDashboard(dbInstance, sessionID) {
   try {
     dashboard = await import("./dashboard/server.js")
-    dashboard.init(dbInstance)
+    dashboard.init(dbInstance, sessionID)
     dashboard.start()
+    dashboardStarted = true
+    console.log(`[Persistence] Dashboard initialized for session ${sessionID}`)
   } catch (e) {
     console.error("[Persistence] Dashboard failed to start:", e.message)
   }
@@ -76,9 +80,6 @@ async function ensureStorage() {
 
   autoSaveTimer = setInterval(() => { flush().catch(() => {}) }, 30_000)
   if (autoSaveTimer.unref) autoSaveTimer.unref()
-
-  // Start dashboard
-  await initDashboard(db)
 }
 
 let mutexQueue = Promise.resolve()
@@ -454,6 +455,11 @@ export async function PersistencePlugin(input, options = {}) {
         case "session.created": {
           const info = event.properties?.info, sid = info?.id || event.properties?.sessionID
           if (sid) {
+            // Запускаем дашборд только при первом session.created
+            if (!dashboardStarted) {
+              await initDashboard(db, sid)
+            }
+
             await rSession(sid, info?.agent, info?.model, projectDir)
             broadcastDashboardEvent('session_start', { session_id: sid, agent: info?.agent, model: info?.model, project_dir: projectDir })
           }
