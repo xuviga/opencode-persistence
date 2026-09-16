@@ -5,13 +5,87 @@ const WS_URL = `ws://${window.location.hostname}:${window.location.port}/ws`;
 let ws = null, simulation, svg, width, height;
 let nodes = [], links = [];
 
-document.addEventListener('DOMContentLoaded', () => {
-    initGraph();
-    connectWebSocket();
-    loadStats();
-    initControls();
-    window.addEventListener('resize', onResize);
-});
+// === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ВЫНЕСЕНЫ НАВЕРХ ===
+function getLinkColor(type) {
+    const colors = {
+        'contains': '#33e0ff',
+        'executes': '#ffaa00',
+        'modifies': '#ffcc00',
+        'threw': '#ff3355'
+    };
+    return colors[type] || '#8899aa';
+}
+
+function organicBlobPath(radius) {
+    const points = 8;
+    const path = [];
+    for (let i = 0; i <= points; i++) {
+        const angle = (Math.PI * 2 / points) * i;
+        const variation = 0.8 + Math.random() * 0.4;
+        const r = radius * variation;
+        const x = Math.cos(angle) * r;
+        const y = Math.sin(angle) * r;
+        path.push(i === 0 ? `M ${x} ${y}` : `L ${x} ${y}`);
+    }
+    return path.join(' ') + ' Z';
+}
+
+function createLiquidNode(g, d) {
+    g.append('circle')
+        .attr('class', 'aura')
+        .attr('r', d.size * 2.2)
+        .attr('stroke', d.color)
+        .attr('fill', 'none')
+        .attr('stroke-width', 3)
+        .attr('stroke-opacity', 0.15)
+        .attr('filter', 'url(#glow)');
+
+    const path = organicBlobPath(d.size);
+    g.append('path')
+        .attr('class', 'liquid-body')
+        .attr('d', path)
+        .attr('fill', d.color)
+        .attr('opacity', 0.85)
+        .attr('stroke', d.color)
+        .attr('stroke-width', 2)
+        .attr('stroke-opacity', 0.9)
+        .attr('filter', 'url(#glow)');
+
+    g.append('circle')
+        .attr('class', 'core')
+        .attr('r', d.size * 0.35)
+        .attr('fill', '#ffffff')
+        .attr('opacity', 0.6);
+
+    const bubbles = 3;
+    for (let i = 0; i < bubbles; i++) {
+        const angle = (Math.PI * 2 / bubbles) * i + Math.random();
+        const dist = d.size * (0.4 + Math.random() * 0.3);
+        const bx = Math.cos(angle) * dist;
+        const by = Math.sin(angle) * dist;
+
+        g.append('circle')
+            .attr('cx', bx).attr('cy', by)
+            .attr('r', d.size * 0.12)
+            .attr('fill', '#ffffff')
+            .attr('opacity', 0.3);
+    }
+
+    g.append('text')
+        .attr('dy', d => d.size + 18)
+        .text(d => d.label)
+        .attr('font-size', d => Math.max(10, d.size * 0.9));
+}
+
+function dragstarted(event, d) {
+    if (!event.active) simulation.alphaTarget(0.3).restart();
+    d.fx = d.x; d.fy = d.y;
+}
+function dragged(event, d) { d.fx = event.x; d.fy = event.y; }
+function dragended(event, d) {
+    if (!event.active) simulation.alphaTarget(0);
+    d.fx = null; d.fy = null;
+}
 
 function onResize() {
     width = document.getElementById('graph-container').clientWidth;
@@ -25,7 +99,6 @@ function initGraph() {
     width = document.getElementById('graph-container').clientWidth;
     height = document.getElementById('graph-container').clientHeight;
 
-    // Одна универсальная радиальная градация
     const defs = svg.append('defs');
 
     const gradient = defs.append('radialGradient')
@@ -45,7 +118,6 @@ function initGraph() {
         .attr('offset', '100%')
         .attr('stop-opacity', 0.2);
 
-    // Фильтр свечения
     const filter = defs.append('filter')
         .attr('id', 'glow')
         .attr('x', '-50%').attr('y', '-50%')
@@ -59,7 +131,6 @@ function initGraph() {
     feMerge.append('feMergeNode').attr('in', 'coloredBlur');
     feMerge.append('feMergeNode').attr('in', 'SourceGraphic');
 
-    // Zoom
     const zoom = d3.zoom()
         .scaleExtent([0.2, 5])
         .on('zoom', e => container.attr('transform', e.transform));
@@ -68,7 +139,6 @@ function initGraph() {
 
     const container = svg.append('g').attr('class', 'container');
 
-    // Arrow
     defs.append('marker')
         .attr('id', 'arrowhead')
         .attr('viewBox', '-0 -5 10 10')
@@ -79,7 +149,6 @@ function initGraph() {
         .attr('d', 'M 0,-5 L 10,0 L 0,5')
         .attr('fill', 'rgba(51,224,255,0.4)');
 
-    // Force simulation
     simulation = d3.forceSimulation()
         .force('link', d3.forceLink().id(d => d.id).distance(d => {
             if (d.type === 'contains') return 100;
@@ -98,76 +167,37 @@ function initGraph() {
         .force('y', d3.forceY(height / 2).strength(0.05));
 }
 
-// === Создание "жидких" узлов ===
-function createLiquidNode(g, d) {
-    // 1. Аура — большое свечение
-    g.append('circle')
-        .attr('class', 'aura')
-        .attr('r', d.size * 2.2)
-        .attr('stroke', d.color)
-        .attr('fill', 'none')
-        .attr('stroke-width', 3)
-        .attr('stroke-opacity', 0.15)
-        .attr('filter', 'url(#glow)');
+function connectWebSocket() {
+    ws = new WebSocket(WS_URL);
 
-    // 2. Основная капля — органическая форма
-    const path = organicBlobPath(d.size);
-    g.append('path')
-        .attr('class', 'liquid-body')
-        .attr('d', path)
-        .attr('fill', d.color)
-        .attr('opacity', 0.85)
-        .attr('stroke', d.color)
-        .attr('stroke-width', 2)
-        .attr('stroke-opacity', 0.9)
-        .attr('filter', 'url(#glow)');
+    ws.onopen = () => {
+        console.log('Connected to dashboard server');
+        addEvent('system', 'Connected to live feed');
+    };
 
-    // 3. Внутреннее ядро
-    g.append('circle')
-        .attr('class', 'core')
-        .attr('r', d.size * 0.35)
-        .attr('fill', '#ffffff')
-        .attr('opacity', 0.6);
+    ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        switch (msg.type) {
+            case 'init':
+            case 'graph_update':
+                updateGraph(msg.data);
+                loadStats();
+                break;
+            case 'event':
+                handleLiveEvent(msg.event, msg.data);
+                break;
+        }
+    };
 
-    // 4. Маленькие "пузырьки" на теле
-    const bubbles = 3;
-    for (let i = 0; i < bubbles; i++) {
-        const angle = (Math.PI * 2 / bubbles) * i + Math.random();
-        const dist = d.size * (0.4 + Math.random() * 0.3);
-        const bx = Math.cos(angle) * dist;
-        const by = Math.sin(angle) * dist;
+    ws.onclose = () => {
+        console.log('Disconnected, reconnecting in 3s...');
+        addEvent('system', 'Connection lost, reconnecting...');
+        setTimeout(connectWebSocket, 3000);
+    };
 
-        g.append('circle')
-            .attr('cx', bx)
-            .attr('cy', by)
-            .attr('r', d.size * 0.12)
-            .attr('fill', '#ffffff')
-            .attr('opacity', 0.3);
-    }
-
-    // 5. Подпись
-    g.append('text')
-        .attr('dy', d => d.size + 18)
-        .text(d => d.label)
-        .attr('font-size', d => Math.max(10, d.size * 0.9));
+    ws.onerror = (err) => console.error('WebSocket error:', err);
 }
 
-// Создаёт органическую "каплю" вместо круга
-function organicBlobPath(radius) {
-    const points = 8;
-    const path = [];
-    for (let i = 0; i <= points; i++) {
-        const angle = (Math.PI * 2 / points) * i;
-        const variation = 0.8 + Math.random() * 0.4;
-        const r = radius * variation;
-        const x = Math.cos(angle) * r;
-        const y = Math.sin(angle) * r;
-        path.push(i === 0 ? `M ${x} ${y}` : `L ${x} ${y}`);
-    }
-    return path.join(' ') + ' Z';
-}
-
-// === Обновление графа ===
 function updateGraph(data) {
     if (!data || !data.nodes) return;
 
@@ -176,7 +206,6 @@ function updateGraph(data) {
 
     const container = svg.select('.container');
 
-    // Связи
     let link = container.selectAll('.link')
         .data(links, d => `${d.source.id || d.source}-${d.target.id || d.target}`);
 
@@ -190,7 +219,6 @@ function updateGraph(data) {
         .attr('marker-end', 'url(#arrowhead)')
         .merge(link);
 
-    // Узлы
     let node = container.selectAll('.node')
         .data(nodes, d => d.id);
 
@@ -228,18 +256,7 @@ function updateGraph(data) {
     simulation.alpha(0.3).restart();
 }
 
-function getLinkColor(type) {
-    const colors = {
-        'contains': '#33e0ff',
-        'executes': '#ffaa00',
-        'modifies': '#ffcc00',
-        'threw': '#ff3355'
-    };
-    return colors[type] || '#8899aa';
-}
-
-// === Остальные функции без изменений ===
-
+// === ОСТАЛЬНОЕ ПОДКЛЮЧАЕТСЯ В КОНЦЕ ===
 function showTooltip(event, d) {
     const tooltip = document.getElementById('tooltip');
     let content = `<div class="tooltip-title">${d.label}</div>`;
@@ -428,12 +445,11 @@ function searchNodes(term) {
         );
 }
 
-function dragstarted(event, d) {
-    if (!event.active) simulation.alphaTarget(0.3).restart();
-    d.fx = d.x; d.fy = d.y;
-}
-function dragged(event, d) { d.fx = event.x; d.fy = event.y; }
-function dragended(event, d) {
-    if (!event.active) simulation.alphaTarget(0);
-    d.fx = null; d.fy = null;
-}
+// === ИНИЦИАЛИЗАЦИЯ ===
+document.addEventListener('DOMContentLoaded', () => {
+    initGraph();
+    connectWebSocket();
+    loadStats();
+    initControls();
+    window.addEventListener('resize', onResize);
+});
